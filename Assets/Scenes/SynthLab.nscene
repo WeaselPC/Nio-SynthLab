@@ -1,0 +1,35 @@
+Scene: SynthLab.nscene
+ClearColor: [0.100000001, 0.100000001, 0.100000001]
+EnvAmbient: [1, 1, 1, 1]
+UseYDepthSorting: false
+Entities:
+  - Entity: 2867570805753845114
+    NameComponent:
+      Name: Synth Lab
+    ScriptComponent:
+      Type: SynthLabApp
+      Fields:
+        - Id: 11927422545742711422
+          Kind: 0
+          Bits: 0
+    TransformComponent:
+      Linked: false
+      Translation: [0, 0, 0]
+      Size: [1, 1]
+      Rotation: 0
+      NumChild: 0
+  - Entity: 7492034437442859861
+    CameraComponent:
+      isMain: true
+      Camera:
+        OrthographicSize: 10
+        OrthographicNear: -1
+        OrthographicFar: 1
+    NameComponent:
+      Name: Camera
+    TransformComponent:
+      Linked: false
+      Translation: [0, 0, 0]
+      Size: [1, 1]
+      Rotation: 0
+      NumChild: 0

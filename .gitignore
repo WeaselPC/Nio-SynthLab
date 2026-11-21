@@ -1,0 +1,18 @@
+# BEGIN Nio managed section
+.vs/
+Libraries/
+Generated/
+Build/
+Cache/
+logs/
+*.csproj
+*.csproj.user
+*.dat
+*.nsrp
+*.nfrp
+*.nsproj
+Captures/
+# END Nio managed section
+
+Assets/Presets-Dev.ns*
+Songs

@@ -1,0 +1,59 @@
+Project:
+  Name: synth-lab
+  DisplayName: Synth Lab
+  StudioName: W3sl
+  ApplicationId: ""
+  AppIcon: Textures/AppIcon.png
+  AppIcon48: ""
+  AppIcon32: Textures/AppIcon32.png
+  AppIcon16: ""
+  AppVersion: 1.0
+  PrefsLocation: 0
+  Display:
+    Mode: 0
+    Resizable: true
+    Decorated: true
+    StartMaximized: false
+    VSync: true
+    FrameRateLimit: 144
+  NioCode: NIO2D-NS
+  AssetDirectory: Assets
+  StartScene: Scenes/SynthLab.nscene
+  EditorLastScene: Scenes/SynthLab.nscene
+  DefaultFont: Fonts/ubuntu.medium.ttf
+  UseAot: true
+  UsePixelRendering: false
+  PixelUnits: 16
+  UseLightBanding: true
+  LightBanding: 23
+  ShadowResolution: 1
+  EdgeLightAmount: 1
+  EdgeLightCost: 1
+  PolarEdgeLight: false
+  LightingMode: 1
+  sceneDef_envColor: [1, 1, 1, 1]
+  sceneDef_useYSort: false
+  FixedTimeStep: 0.0166666675
+  SubSteps: 4
+  CollisionLayers: [Default, Ignore Raycast, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+  CollisionMatrix: [4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295]
+  RenderPipeline:
+    - Name: RenderScene
+      Kind: 0
+      Enabled: true
+    - Name: Lighting
+      Kind: 0
+      Enabled: true
+    - Name: FxScene
+      Kind: 0
+      Enabled: true
+    - Name: Upscale
+      Kind: 0
+      Enabled: true
+      SubPixelOffset: true
+    - Name: UI
+      Kind: 0
+      Enabled: true
+    - Name: Present
+      Kind: 0
+      Enabled: true

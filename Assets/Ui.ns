@@ -1,0 +1,536 @@
+using NioEngine;
+
+// Stateful widgets need stable, unique, nonzero IDs.
+public static class Ui
+{
+    public static Color Bg = Color(0.075f, 0.08f, 0.095f, 1.0f);
+    public static Color Panel = Color(0.115f, 0.122f, 0.145f, 1.0f);
+    public static Color Panel2 = Color(0.155f, 0.165f, 0.195f, 1.0f);
+    public static Color Field = Color(0.2f, 0.21f, 0.25f, 1.0f);
+    public static Color FieldHot = Color(0.26f, 0.275f, 0.32f, 1.0f);
+    public static Color Line = Color(0.24f, 0.25f, 0.29f, 1.0f);
+    public static Color Text = Color(0.86f, 0.87f, 0.9f, 1.0f);
+    public static Color Dim = Color(0.55f, 0.57f, 0.63f, 1.0f);
+    public static Color Accent = Color(0.36f, 0.78f, 0.95f, 1.0f);
+    public static Color AccentDim = Color(0.22f, 0.45f, 0.56f, 1.0f);
+    public static Color Warn = Color(0.98f, 0.62f, 0.3f, 1.0f);
+
+    public const float Gap = 6.0f;
+    public const float Pad = 4.0f;
+
+    static Color[] s_trackColors = [Color(0.36f, 0.78f, 0.95f, 1.0f), Color(0.98f, 0.62f, 0.3f, 1.0f), Color(0.55f, 0.85f, 0.45f, 1.0f),
+        Color(0.85f, 0.5f, 0.9f, 1.0f), Color(0.98f, 0.85f, 0.35f, 1.0f), Color(0.45f, 0.6f, 1.0f, 1.0f),
+        Color(0.95f, 0.45f, 0.55f, 1.0f), Color(0.4f, 0.9f, 0.8f, 1.0f)];
+
+    public static Vec2f mouse;
+    public static bool down;
+    public static bool pressed;
+    public static bool released;
+    public static bool rightPressed;
+    public static float wheel;
+    public static float dt;
+    public static bool ctrl;
+    public static bool shift;
+    public static bool alt;
+    public static bool committed;
+
+    const float MenuRow = 18.0f;
+    const float TipDelay = 0.55f;
+
+    static int s_dragging;
+    static bool s_captured;
+    static bool s_menuHasMouse;
+    static bool s_hitLimited;
+    static Rect s_hitArea;
+
+    // Scroll views handle the wheel before sliders report hover this frame.
+    static bool s_sliderOverMouse;
+    static bool s_sliderWasOverMouse;
+
+    static double s_dragStartValue;
+    static float s_dragStartX;
+
+    static int s_menu;
+    static Rect s_menuRect;
+    static string[] s_menuOptions;
+    static int s_menuCurrent;
+    static ScrollViewState s_menuView;
+    static int s_chosenFor;
+    static int s_choice;
+
+    static InputFieldState s_field;
+    static int s_typing;
+    static Rect s_typingRect;
+    static bool s_typingSeen;
+    static int s_typedFor;
+    static string s_typedText = "";
+    static long s_typedFrame;
+
+    static string s_tip = "";
+    static Rect s_tipRect;
+    static Rect s_tipHoverRect;
+    static bool s_tipHover;
+    static float s_tipTime;
+
+    static Texture s_pixel;
+    static Texture s_editIcon;
+
+    public static Color TrackColor(int index) { return s_trackColors[index % s_trackColors.Length]; }
+
+    public static Color Alpha(Color c, float a) { return Color(c.r, c.g, c.b, a); }
+
+    public static void Begin(float deltaTime)
+    {
+        if (s_pixel == null) { Init(); }
+        dt = deltaTime;
+        mouse = RectUtils.ToUIPosition(Input.GetMousePosition());
+        down = Input.IsMouseButtonPressed(MouseButton.Left);
+        pressed = Input.IsMouseButtonPressedThisFrame(MouseButton.Left);
+        released = Input.IsMouseButtonReleasedThisFrame(MouseButton.Left);
+        rightPressed = Input.IsMouseButtonPressedThisFrame(MouseButton.Right);
+        wheel = Input.GetMouseScrollDelta();
+        ctrl = Input.IsKeyPressed(KeyCode.LeftControl) || Input.IsKeyPressed(KeyCode.RightControl);
+        shift = Input.IsKeyPressed(KeyCode.LeftShift) || Input.IsKeyPressed(KeyCode.RightShift);
+        alt = Input.IsKeyPressed(KeyCode.LeftAlt) || Input.IsKeyPressed(KeyCode.RightAlt);
+        committed = false;
+        s_sliderWasOverMouse = s_sliderOverMouse;
+        s_sliderOverMouse = false;
+        s_tipHover = false;
+        s_typingSeen = false;
+        s_hitLimited = false;
+        s_menuHasMouse = s_menu != 0 && s_menuRect.Contains(mouse);
+        if (s_menu != 0 && (pressed || rightPressed) && !s_menuHasMouse)
+        {
+            s_menu = 0;
+            s_menuHasMouse = true;
+        }
+    }
+
+    public static void End()
+    {
+        if (s_typing != 0) { DrawTyping(); }
+        if (s_menu != 0) { DrawMenu(); }
+        if (!s_tipHover)
+        {
+            s_tipRect = Rect(0.0f, 0.0f, 0.0f, 0.0f);
+            s_tipTime = 0.0f;
+        }
+        else
+        {
+            if (!SameRect(s_tipHoverRect, s_tipRect))
+            {
+                s_tipRect = s_tipHoverRect;
+                s_tipTime = 0.0f;
+            }
+            s_tipTime += dt;
+            if (s_tipTime > TipDelay && s_dragging == 0 && !s_captured) { DrawTip(); }
+        }
+        if (s_dragging != 0 && !down)
+        {
+            s_dragging = 0;
+            committed = true;
+        }
+    }
+
+    static void Init()
+    {
+        Color[] white = [Color.White];
+        s_pixel = Texture.Create(1, 1, white);
+        s_editIcon = Resources.Load<Texture>("Textures/EditIcon.png");
+        s_menuView = ScrollView();
+        s_menuView.wheelScrollSpeed = 36.0f;
+        s_field = InputFieldState.GetDefault();
+        s_field.textColor = Text;
+        s_field.charLimit = 16;
+    }
+
+    static bool Hot(Rect r) { return Free() && r.Contains(mouse); }
+
+    public static bool Free()
+    {
+        return !s_menuHasMouse && s_dragging == 0 && !s_captured && (!s_hitLimited || s_hitArea.Contains(mouse));
+    }
+
+    public static bool Hover(Rect r)
+    {
+        return !s_menuHasMouse && r.Contains(mouse) && (!s_hitLimited || s_hitArea.Contains(mouse));
+    }
+
+    public static void Capture(bool on) { s_captured = on; }
+
+    public static void LimitHits(Rect area)
+    {
+        s_hitLimited = true;
+        s_hitArea = area;
+    }
+
+    public static void EndLimitHits() { s_hitLimited = false; }
+
+    public static ScrollViewState ScrollView()
+    {
+        if (s_pixel == null) { Init(); }
+        ScrollViewState view = ScrollViewState.GetDefault();
+        view.fillTex = s_pixel;
+        view.trackColor = Alpha(Line, 0.5f);
+        view.thumbColor = FieldHot;
+        view.thumbDragColor = Dim;
+        view.trackWidth = 6.0f;
+        return view;
+    }
+
+    public static float WheelSpeed()
+    {
+        return Free() && s_menu == 0 && !s_sliderWasOverMouse ? 30.0f : 0.0f;
+    }
+
+    public static TextSettings Settings(float size, HorizontalAlignment align)
+    {
+        TextSettings ts = TextSettings.GetDefault();
+        ts.fontSize = size;
+        ts.horizontalAlignment = align;
+        ts.wrapText = false;
+        return ts;
+    }
+
+    public static void Label(Rect r, string text, Color color, float size = 4.4f, HorizontalAlignment align = HorizontalAlignment.Left)
+    {
+        r.DrawText(text, null, color, Settings(size, align));
+    }
+
+    public static bool TextField(Rect r, ref InputFieldState state)
+    {
+        r.Draw(state.isSelected ? FieldHot : Field, true);
+        return EditText(r, ref state, 4.6f, 10.0f);
+    }
+
+    public static bool EditableLabel(Rect r, ref InputFieldState state, string tip = "")
+    {
+        if (state.isSelected) { r.Draw(FieldHot, true); }
+        else
+        {
+            bool hot = Hot(r);
+            if (hot) { r.Draw(Field, true); }
+            Rect(r.max.x - r.height, r.min.y, r.max.x, r.max.y).Grow(-4.0f).DrawImage(s_editIcon, hot ? Text : Dim);
+            Tip(r, tip);
+        }
+        return EditText(r, ref state, 5.0f, Pad);
+    }
+
+    // Expand the field to compensate for the engine's 10-unit text inset.
+    static bool EditText(Rect r, ref InputFieldState state, float size, float textInset)
+    {
+        bool wasSelected = state.isSelected;
+        float inset = Mathf.Max(0.0f, (r.height - 18.0f) * 0.5f);
+        Rect field = Rect(r.min.x - 10.0f + textInset, r.min.y - 10.0f + inset, r.max.x, r.max.y + 10.0f - inset);
+        InputFieldState s = state;
+        field.DrawInputField(ref s, null, Settings(size, HorizontalAlignment.Left), dt);
+        if (pressed && !r.Contains(mouse)) { s.isSelected = false; }
+        state = s;
+        return wasSelected && !s.isSelected;
+    }
+
+    public static void Tip(Rect r, string text)
+    {
+        if (text == null || text == "" || !Hover(r)) { return; }
+        s_tipHover = true;
+        s_tipHoverRect = r;
+        s_tip = text;
+    }
+
+    static bool SameRect(Rect a, Rect b)
+    {
+        return a.min.x == b.min.x && a.min.y == b.min.y && a.max.x == b.max.x && a.max.y == b.max.y;
+    }
+
+    static void DrawTip()
+    {
+        TextSettings ts = Settings(4.2f, HorizontalAlignment.Left);
+        ts.wrapText = true;
+        float width = 260.0f;
+        Rect measured = Rect(0.0f, 0.0f, width - 16.0f, 400.0f).DrawText(s_tip, null, Text, ts, 0.0f, true);
+        float h = measured.height + 14.0f;
+        Rect screen = Screen.GetUIRect();
+        float x = Mathf.Min(mouse.x + 14.0f, screen.max.x - width - 4.0f);
+        float y = Mathf.Max(mouse.y - 18.0f, screen.min.y + h + 4.0f);
+        Rect box = Rect(x, y - h, x + width, y);
+        Box(box, Color(0.04f, 0.045f, 0.055f, 0.97f), Line);
+        box.Grow(-7.0f).DrawText(s_tip, null, Text, ts);
+    }
+
+    public static void Box(Rect r, Color fill, Color edge)
+    {
+        r.Draw(fill, true);
+        r.Draw(edge, 1.0f);
+    }
+
+    public static bool Button(Rect r, string label, bool selected = false, string tip = "")
+    {
+        bool hot = Hot(r);
+        r.Draw(selected ? AccentDim : (hot ? FieldHot : Field), true);
+        Label(r, label, hot || selected ? Color.White : Text, 4.4f, HorizontalAlignment.Center);
+        Tip(r, tip);
+        if (selected) { r.CutBottom(2.0f).Draw(Accent, true); }
+        return hot && pressed;
+    }
+
+    public static bool SmallButton(Rect r, string label, string tip = "")
+    {
+        bool hot = Hot(r);
+        if (hot) { r.Draw(FieldHot, true); }
+        Label(r, label, hot ? Color.White : Dim, 4.2f, HorizontalAlignment.Center);
+        Tip(r, tip);
+        return hot && pressed;
+    }
+
+    public static bool Toggle(Rect r, string label, bool value, string tip = "")
+    {
+        if (!Button(r, label, value, tip)) { return value; }
+        committed = true;
+        return !value;
+    }
+
+    public static double Param(Rect r, int id, ParamDef p, double v, string tip = "")
+    {
+        if (p.kind == ParamKind.Toggle)
+        {
+            Rect valueBox = r.CutRight(52.0f);
+            Label(r.Grow(0.0f, 0.0f, 0.0f, -4.0f), p.label, Dim, 4.2f);
+            bool on = v >= 0.5;
+            return Toggle(valueBox, on ? "on" : "off", on, tip) ? 1.0 : 0.0;
+        }
+        if (p.kind == ParamKind.Choice)
+        {
+            Rect valueBox = r.CutRight(Mathf.Max(90.0f, r.width * 0.5f));
+            Label(r.Grow(0.0f, 0.0f, 0.0f, -4.0f), p.label, Dim, 4.2f);
+            return (double)Dropdown(valueBox, id, p.options, (int)Math.Round(v), tip);
+        }
+
+        double typed = 0.0;
+        if (TakeTyped(id, out typed))
+        {
+            typed = p.Clamp(typed);
+            if (typed != v) { committed = true; }
+            v = typed;
+        }
+        if (TypingInto(r, id, p.label)) { return v; }
+
+        bool hot = Hot(r);
+        if (hot) { s_sliderOverMouse = true; }
+        if (hot && pressed)
+        {
+            s_dragging = id;
+            s_dragStartValue = p.ToUnit(v);
+            s_dragStartX = mouse.x;
+        }
+        double result = v;
+        if (s_dragging == id && down)
+        {
+            double travel = (double)(mouse.x - s_dragStartX) / (double)Mathf.Max(40.0f, r.width);
+            result = p.Clamp(p.FromUnit(s_dragStartValue + travel * (shift ? 0.1 : 1.0)));
+        }
+        else if (hot && wheel != 0.0f)
+        {
+            double notch = wheel > 0.0f ? 1.0 : -1.0;
+            result = p.kind == ParamKind.Int ? p.Clamp(v + notch) : p.Clamp(p.FromUnit(p.ToUnit(v) + notch * (shift ? 0.004 : 0.02)));
+            if (result != v) { committed = true; }
+        }
+        if (hot && rightPressed)
+        {
+            if (!ctrl) { BeginTyping(id, r, p.Format(result)); }
+            else if (v != p.def)
+            {
+                result = p.def;
+                committed = true;
+            }
+        }
+
+        bool dragged = s_dragging == id;
+        r.Draw(dragged || hot ? FieldHot : Field, true);
+        float filled = (float)Math.Clamp(p.ToUnit(result), 0.0, 1.0) * r.width;
+        Rect(r.min.x, r.min.y, r.min.x + filled, r.max.y).Draw(dragged ? Accent : AccentDim, true);
+        Tip(r, tip);
+        r.Grow(0.0f, -6.0f, 0.0f, -6.0f);
+        Label(r, p.label, Text, 4.2f);
+        Label(r, p.Format(result), Text, 4.2f, HorizontalAlignment.Right);
+        return result;
+    }
+
+    public static double Number(Rect r, int id, string label, double v, double min, double max, double step, int decimals, string tip = "")
+    {
+        double typed = 0.0;
+        if (TakeTyped(id, out typed))
+        {
+            typed = Math.Clamp(decimals <= 0 ? Math.Round(typed) : typed, min, max);
+            if (typed != v) { committed = true; }
+            v = typed;
+        }
+        if (TypingInto(r, id, label)) { return v; }
+
+        bool hot = Hot(r);
+        if (hot) { s_sliderOverMouse = true; }
+        if (hot && pressed)
+        {
+            s_dragging = id;
+            s_dragStartValue = v;
+            s_dragStartX = mouse.x;
+        }
+        double result = v;
+        if (s_dragging == id && down)
+        {
+            double steps = Math.Round((double)(mouse.x - s_dragStartX) / (shift ? 24.0 : 6.0));
+            result = Math.Clamp(s_dragStartValue + steps * step, min, max);
+        }
+        else if (hot && wheel != 0.0f)
+        {
+            result = Math.Clamp(v + (wheel > 0.0f ? step : -step), min, max);
+            if (result != v) { committed = true; }
+        }
+        string text = decimals <= 0 ? $"{(long)Math.Round(result)}" : (decimals == 1 ? $"{result:F1}" : $"{result:F2}");
+        if (hot && rightPressed) { BeginTyping(id, r, text); }
+
+        r.Draw(s_dragging == id || hot ? FieldHot : Field, true);
+        Tip(r, tip);
+        r.Grow(0.0f, -5.0f, 0.0f, -5.0f);
+        Label(r, label, Dim, 4.0f);
+        Label(r, text, Text, 4.4f, HorizontalAlignment.Right);
+        return result;
+    }
+
+    public static bool Typing() { return s_typing != 0; }
+
+    static void BeginTyping(int id, Rect r, string current)
+    {
+        if (s_typing != 0 && s_typing != id) { FinishTyping(); }
+        s_field.currentValue = "";
+        s_field.preview = current;
+        s_field.isSelected = true;
+        s_typing = id;
+        s_typingRect = ValuePart(r);
+        s_typingSeen = true;
+    }
+
+    static Rect ValuePart(Rect r) { return Rect(r.min.x + r.width * 0.45f, r.min.y, r.max.x, r.max.y); }
+
+    static bool TypingInto(Rect r, int id, string label)
+    {
+        if (s_typing != id) { return false; }
+        s_typingSeen = true;
+        s_typingRect = ValuePart(r);
+        Box(r, FieldHot, Accent);
+        Label(r.Grow(0.0f, -6.0f, 0.0f, -6.0f), label, Dim, 4.2f);
+        return true;
+    }
+
+    // Draw after scroll views because the engine field clears the active clip.
+    static void DrawTyping()
+    {
+        if (!s_typingSeen)
+        {
+            s_typing = 0;
+            return;
+        }
+        bool cancelled = Input.IsKeyPressedThisFrame(KeyCode.Escape);
+        Rect field = Rect(s_typingRect.min.x - 4.0f, s_typingRect.min.y - 10.0f, s_typingRect.max.x + 4.0f, s_typingRect.max.y + 10.0f);
+        InputFieldState state = s_field;
+        field.DrawInputField(ref state, null, Settings(4.4f, HorizontalAlignment.Left), dt);
+        if (pressed && !s_typingRect.Contains(mouse)) { state.isSelected = false; }
+        s_field = state;
+        if (state.isSelected) { return; }
+        if (!cancelled) { FinishTyping(); }
+        s_typing = 0;
+    }
+
+    static void FinishTyping()
+    {
+        s_typedFor = s_typing;
+        s_typedText = s_field.currentValue;
+        s_typedFrame = Game.GetFrameNumber();
+    }
+
+    static bool TakeTyped(int id, out double value)
+    {
+        value = 0.0;
+        if (s_typedFor != id) { return false; }
+        s_typedFor = 0;
+        return Game.GetFrameNumber() <= s_typedFrame + 1 && double.TryParse(s_typedText.Trim(), out value);
+    }
+
+    public static int Dropdown(Rect r, int id, string[] options, int current, string tip = "")
+    {
+        int chosen = 0;
+        if (TakeChoice(id, out chosen) && chosen != current)
+        {
+            current = chosen;
+            committed = true;
+        }
+        bool hot = Hot(r);
+        r.Draw(hot || s_menu == id ? FieldHot : Field, true);
+        Tip(r, tip);
+        if (hot && pressed) { OpenMenu(id, r, options, current, 150.0f); }
+        r.Grow(0.0f, -6.0f, 0.0f, -6.0f);
+        Label(r, current >= 0 && current < options.Length ? options[current] : "", Text, 4.2f);
+        Label(r, "v", Dim, 3.6f, HorizontalAlignment.Right);
+        return current;
+    }
+
+    public static int Menu(Rect r, int id, string label, string[] options, string tip = "")
+    {
+        int chosen = 0;
+        if (TakeChoice(id, out chosen)) { return chosen; }
+        bool hot = Hot(r);
+        r.Draw(hot || s_menu == id ? FieldHot : Field, true);
+        Label(r, label, hot ? Color.White : Text, 4.4f, HorizontalAlignment.Center);
+        Tip(r, tip);
+        if (hot && pressed) { OpenMenu(id, r, options, -1, 190.0f); }
+        return -1;
+    }
+
+    static void OpenMenu(int id, Rect anchor, string[] options, int current, float minWidth)
+    {
+        s_menu = id;
+        s_menuOptions = options;
+        s_menuCurrent = current;
+        s_menuView.scroll = 0.0f;
+        float h = Mathf.Min(MenuRow * (float)options.Length + 4.0f, 420.0f);
+        float w = Mathf.Max(anchor.width, minWidth);
+        Rect screen = Screen.GetUIRect();
+        float top = anchor.min.y;
+        if (top - h < screen.min.y + 4.0f) { top = anchor.max.y + h; }
+        float left = Mathf.Min(anchor.min.x, screen.max.x - w - 4.0f);
+        s_menuRect = Rect(left, top - h, left + w, top);
+        s_menuHasMouse = true;
+    }
+
+    static bool TakeChoice(int id, out int choice)
+    {
+        choice = s_choice;
+        if (s_chosenFor != id) { return false; }
+        s_chosenFor = 0;
+        return true;
+    }
+
+    static void DrawMenu()
+    {
+        Box(s_menuRect, Color(0.06f, 0.065f, 0.08f, 0.98f), Line);
+        ScrollViewState view = s_menuView;
+        s_menuRect.BeginScrollView(ref view, MenuRow * (float)s_menuOptions.Length + 4.0f);
+        for (int i = 0; i < s_menuOptions.Length; i++)
+        {
+            float top = view.topY - 2.0f - MenuRow * (float)i;
+            Rect row = Rect(view.content.min.x + 2.0f, top - MenuRow, view.content.max.x - 2.0f, top);
+            if (row.max.y < s_menuRect.min.y || row.min.y > s_menuRect.max.y) { continue; }
+            bool hot = view.mouseInside && row.Contains(mouse);
+            if (hot) { row.Draw(AccentDim, true); }
+            else if (i == s_menuCurrent) { row.Draw(Field, true); }
+            Label(row.Grow(0.0f, -6.0f, 0.0f, -8.0f), s_menuOptions[i], hot || i == s_menuCurrent ? Color.White : Text, 4.2f);
+            if (hot && pressed)
+            {
+                s_choice = i;
+                s_chosenFor = s_menu;
+                s_menu = 0;
+            }
+        }
+        view.EndScrollView();
+        s_menuView = view;
+    }
+}

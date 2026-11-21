@@ -1,0 +1,1049 @@
+using NioEngine;
+
+public enum Gesture
+{
+    None,
+    MoveNotes,
+    ResizeNotes,
+    BoxSelect,
+    Velocity,
+    PlayKeys,
+    RulerClick,
+    Scrub,
+    RulerZoom,
+    Pan,
+    ScrollTime,
+    ZoomTimeStart,
+    ZoomTimeEnd,
+    ScrollPitch,
+    ZoomPitchLow,
+    ZoomPitchHigh
+}
+
+public class PianoRoll
+{
+    const double MinZoom = 1.0;
+    const double MaxZoom = 160.0;
+    const double MinRow = 3.0;
+    const double MaxRow = 28.0;
+    const double ShortestNote = 0.03125;
+
+    static string[] SnapNames = ["Off", "1/16", "1/8", "1/4", "1/2", "Beat", "Bar"];
+    static double[] SnapBeats = [0.0, 0.0625, 0.125, 0.25, 0.5, 1.0, 0.0];
+    const int SnapBar = 6;
+
+    static string[] s_noteNames;
+    static List<string> s_numbers = new List<string>();
+
+    SynthLabApp _app;
+
+    Rect _area;
+    Rect _toolbar;
+    Rect _ruler;
+    Rect _keys;
+    Rect _grid;
+    Rect _lane;
+    Rect _hbar;
+    Rect _vbar;
+    Rect _corner;
+
+    double _pxPerBeat = 22.0;
+    double _rowH = 9.0;
+    double _scrollBeats;
+    double _lowPitch = 50.0;
+    double _glideBeats;
+    double _glidePitch;
+    double _contentBeats;
+
+    int _snap = 2;
+    bool _ghosts = true;
+    bool _audition = true;
+    bool _follow;
+
+    List<Note> _selection = new List<Note>();
+    List<Note> _clipboard = new List<Note>();
+
+    Gesture _gesture = Gesture.None;
+    bool _ending;
+    Vec2f _grabMouse;
+    double _grabBeat;
+    double _grabPitch;
+    double _grabScroll;
+    double _grabLow;
+    double _grabZoom;
+    MouseButton _panButton;
+    double _barTotal;
+    double _barStart;
+    double _barEdge;
+    double _barOffset;
+    // Release coordinates can differ from the last held position.
+    Vec2f _heldMouse;
+    Note _dragNote;
+    double[] _beforeDrag;
+    double _auditionedPitch = -1.0;
+    int _keyPitch = -1;
+    double _lastLength = 1.0;
+
+    // Defer overlap trimming so nudges can pass through other notes.
+    List<Note> _settle = new List<Note>();
+    Track _settleTrack;
+    float _settleAt;
+
+    List<Note> _links = new List<Note>();
+    Track _linksTrack;
+    int _linksSerial = -1;
+
+    public PianoRoll(SynthLabApp app)
+    {
+        _app = app;
+        if (s_noteNames != null) { return; }
+        string[] names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        s_noteNames = new string[128];
+        for (int pitch = 0; pitch < 128; pitch++) { s_noteNames[pitch] = names[pitch % 12] + $"{pitch / 12 - 1}"; }
+    }
+
+    public void Place(Rect area)
+    {
+        _area = area;
+        Rect r = area;
+        _toolbar = r.CutTop(20.0f + Ui.Pad * 2.0f).Grow(-Ui.Pad);
+        Rect top = r.CutTop(18.0f);
+        Rect bottom = r.CutBottom(46.0f);
+        Rect scroll = r.CutBottom(12.0f);
+        _keys = r.CutLeft(36.0f);
+        _vbar = r.CutRight(12.0f);
+        _grid = r;
+        top.CutLeft(36.0f);
+        top.CutRight(12.0f);
+        _ruler = top;
+        bottom.CutLeft(36.0f);
+        bottom.CutRight(12.0f);
+        _lane = bottom;
+        _corner = scroll.CutLeft(36.0f);
+        scroll.CutRight(12.0f);
+        _hbar = scroll;
+    }
+
+    public void ClearSelection() { _selection.Clear(); }
+
+    public void Fit()
+    {
+        Song song = _app.song;
+        _contentBeats = ContentBeats(song);
+        _pxPerBeat = Math.Clamp((double)_grid.width / (song.LoopBeats() + song.tail / song.Beat()), MinZoom, MaxZoom);
+        _scrollBeats = 0.0;
+        double lo = 0.0;
+        double hi = 0.0;
+        PitchRange(_app.track, out lo, out hi);
+        _rowH = Math.Clamp((double)_grid.height / (hi - lo + 7.0), MinRow, 12.0);
+        _lowPitch = Math.Floor((lo + hi) * 0.5 - Rows() * 0.5);
+        StopGlide();
+        ClampView();
+    }
+
+    public void ShowTrackNotes()
+    {
+        Track t = _app.track;
+        if (t == null || t.notes.Count() == 0) { return; }
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            if (t.notes[i].pitch >= _lowPitch && t.notes[i].pitch < _lowPitch + Rows()) { return; }
+        }
+        double lo = 0.0;
+        double hi = 0.0;
+        PitchRange(t, out lo, out hi);
+        _lowPitch = Math.Floor((lo + hi) * 0.5 - Rows() * 0.5);
+        _scrollBeats = 0.0;
+        ClampView();
+    }
+
+    public void Shortcuts()
+    {
+        Song song = _app.song;
+        bool ctrl = Ui.ctrl;
+        if (!ctrl && Input.IsKeyPressedThisFrame(KeyCode.F)) { Fit(); }
+        if (!ctrl && Input.IsKeyPressedThisFrame(KeyCode.Z)) { ZoomToNotes(); }
+        if (!ctrl && (Input.IsKeyPressedThisFrame(KeyCode.Equal) || Input.IsKeyPressedThisFrame(KeyCode.KPAdd))) { ZoomAtHead(1.25); }
+        if (!ctrl && (Input.IsKeyPressedThisFrame(KeyCode.Minus) || Input.IsKeyPressedThisFrame(KeyCode.KPSubtract))) { ZoomAtHead(1.0 / 1.25); }
+        if (Input.IsKeyPressedThisFrame(KeyCode.Home))
+        {
+            _scrollBeats = 0.0;
+            _glideBeats = 0.0;
+        }
+        if (Input.IsKeyPressedThisFrame(KeyCode.End))
+        {
+            _scrollBeats = Math.Max(0.0, song.LoopBeats() - (double)_grid.width / _pxPerBeat * 0.9);
+            _glideBeats = 0.0;
+        }
+        if (Input.IsKeyPressedThisFrame(KeyCode.PageUp)) { _glidePitch += 12.0; }
+        if (Input.IsKeyPressedThisFrame(KeyCode.PageDown)) { _glidePitch -= 12.0; }
+
+        Track t = _app.track;
+        if (t == null) { return; }
+        if (Input.IsKeyPressedThisFrame(KeyCode.Escape)) { _selection.Clear(); }
+        if (Input.IsKeyPressedThisFrame(KeyCode.Delete) || Input.IsKeyPressedThisFrame(KeyCode.Backspace))
+        {
+            for (int i = 0; i < _selection.Count(); i++) { t.notes.Remove(_selection[i]); }
+            _selection.Clear();
+            _app.StopPreview();
+            _app.Commit();
+        }
+        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.A))
+        {
+            _selection.Clear();
+            _selection.AddRange(t.notes);
+        }
+        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.C))
+        {
+            _clipboard.Clear();
+            for (int i = 0; i < _selection.Count(); i++) { _clipboard.Add(_selection[i].Copy()); }
+            _app.Flash($"Copied {_clipboard.Count()} notes");
+        }
+        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.V) && _clipboard.Count() > 0) { Paste(t); }
+        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.D) && _selection.Count() > 0) { Duplicate(t); }
+
+        int pitches = 0;
+        if (Input.IsKeyPressedThisFrame(KeyCode.Up)) { pitches = Ui.shift ? 12 : 1; }
+        if (Input.IsKeyPressedThisFrame(KeyCode.Down)) { pitches = Ui.shift ? -12 : -1; }
+        double beats = 0.0;
+        if (Input.IsKeyPressedThisFrame(KeyCode.Right)) { beats = NudgeBeats(); }
+        if (Input.IsKeyPressedThisFrame(KeyCode.Left)) { beats = -NudgeBeats(); }
+        if ((pitches != 0 || beats != 0.0) && _selection.Count() > 0)
+        {
+            for (int i = 0; i < _selection.Count(); i++)
+            {
+                _selection[i].pitch = Math.Clamp(_selection[i].pitch + (double)pitches, 0.0, 127.0);
+                _selection[i].start = Math.Max(0.0, _selection[i].start + beats);
+            }
+            if (pitches != 0 && _selection.Count() == 1) { Audition(t, _selection[0]); }
+            _settle.Clear();
+            _settle.AddRange(_selection);
+            _settleTrack = t;
+            _settleAt = Time.ElapsedTime() + 0.5f;
+            _app.Commit();
+        }
+    }
+
+    public void Update()
+    {
+        Song song = _app.song;
+        Track t = _app.track;
+        _ending = _gesture != Gesture.None && !Held();
+        if (!_ending) { _heldMouse = Ui.mouse; }
+        _contentBeats = ContentBeats(song);
+        Settle();
+        if (_follow && _app.playing) { FollowHead(); }
+
+        Ui.Box(_area, Ui.Panel, Ui.Line);
+        Toolbar(t);
+        Navigate();
+        PlayKeys(t);
+        DrawRows();
+        DrawTimeline(song);
+        DrawNotes(song, t);
+        DrawHead();
+        ScrollBars();
+        if (t != null)
+        {
+            EditNotes(t);
+            VelocityLane(t);
+        }
+        if (_ending) { End(); }
+    }
+
+    void Begin(Gesture gesture)
+    {
+        _gesture = gesture;
+        _grabMouse = Ui.mouse;
+        _grabBeat = BeatAt(Ui.mouse.x);
+        _grabPitch = PitchAt(Ui.mouse.y);
+        _grabScroll = _scrollBeats;
+        _grabLow = _lowPitch;
+        _grabZoom = _pxPerBeat;
+        Ui.Capture(true);
+    }
+
+    void End()
+    {
+        _gesture = Gesture.None;
+        _dragNote = null;
+        _beforeDrag = null;
+        Ui.Capture(false);
+    }
+
+    bool Held() { return _gesture == Gesture.Pan ? Input.IsMouseButtonPressed(_panButton) : Ui.down; }
+
+    float XAt(double beat) { return _grid.min.x + (float)((beat - _scrollBeats) * _pxPerBeat); }
+    double BeatAt(float x) { return (double)(x - _grid.min.x) / _pxPerBeat + _scrollBeats; }
+    double PitchAt(float y) { return (double)(y - _grid.min.y) / _rowH + _lowPitch; }
+    double Rows() { return (double)_grid.height / _rowH; }
+
+    Rect NoteRect(Note n)
+    {
+        float x0 = XAt(n.start);
+        float x1 = Mathf.Max(x0 + 2.0f, XAt(n.End()));
+        float y0 = _grid.min.y + (float)((n.pitch - _lowPitch) * _rowH);
+        return Rect(x0, y0 + 0.5f, x1, y0 + (float)_rowH - 0.5f);
+    }
+
+    double SnapSize() { return _snap == SnapBar ? (double)_app.song.beatsPerBar : SnapBeats[_snap]; }
+
+    double Snap(double beat)
+    {
+        double size = SnapSize();
+        return size > 0.0 ? Math.Round(beat / size) * size : beat;
+    }
+
+    double NudgeBeats()
+    {
+        double size = SnapSize();
+        return size > 0.0 ? size : 0.0625;
+    }
+
+    static double ContentBeats(Song song)
+    {
+        double end = song.LoopBeats() + song.tail / song.Beat();
+        for (int ti = 0; ti < song.tracks.Count(); ti++)
+        {
+            List<Note> notes = song.tracks[ti].notes;
+            for (int i = 0; i < notes.Count(); i++) { end = Math.Max(end, notes[i].End()); }
+        }
+        return end + 4.0;
+    }
+
+    static void PitchRange(Track t, out double lo, out double hi)
+    {
+        lo = 55.0;
+        hi = 72.0;
+        if (t == null || t.notes.Count() == 0) { return; }
+        lo = t.notes[0].pitch;
+        hi = lo;
+        for (int i = 1; i < t.notes.Count(); i++)
+        {
+            lo = Math.Min(lo, t.notes[i].pitch);
+            hi = Math.Max(hi, t.notes[i].pitch);
+        }
+    }
+
+    void ClampView()
+    {
+        _scrollBeats = Math.Clamp(_scrollBeats, 0.0, Math.Max(0.0, _contentBeats - (double)_grid.width / _pxPerBeat));
+        _lowPitch = Math.Clamp(_lowPitch, 0.0, Math.Max(0.0, 128.0 - Rows()));
+    }
+
+    void StopGlide()
+    {
+        _glideBeats = 0.0;
+        _glidePitch = 0.0;
+    }
+
+    void ZoomTime(double factor, float anchorX)
+    {
+        double at = BeatAt(anchorX);
+        _pxPerBeat = Math.Clamp(_pxPerBeat * factor, MinZoom, MaxZoom);
+        _scrollBeats = at - (double)(anchorX - _grid.min.x) / _pxPerBeat;
+        ClampView();
+    }
+
+    void ZoomAtHead(double factor)
+    {
+        float headX = XAt(_app.head);
+        ZoomTime(factor, headX > _grid.min.x && headX < _grid.max.x ? headX : _grid.center.x);
+    }
+
+    void ZoomRows(double factor, float anchorY)
+    {
+        double at = PitchAt(anchorY);
+        _rowH = Math.Clamp(_rowH * factor, MinRow, MaxRow);
+        _lowPitch = at - (double)(anchorY - _grid.min.y) / _rowH;
+        ClampView();
+    }
+
+    void ZoomToNotes()
+    {
+        Track t = _app.track;
+        if (t == null) { return; }
+        List<Note> notes = _selection.Count() > 0 ? _selection : t.notes;
+        if (notes.Count() == 0) { return; }
+        double b0 = notes[0].start;
+        double b1 = notes[0].End();
+        double p0 = notes[0].pitch;
+        double p1 = p0;
+        for (int i = 1; i < notes.Count(); i++)
+        {
+            b0 = Math.Min(b0, notes[i].start);
+            b1 = Math.Max(b1, notes[i].End());
+            p0 = Math.Min(p0, notes[i].pitch);
+            p1 = Math.Max(p1, notes[i].pitch);
+        }
+        _pxPerBeat = Math.Clamp((double)_grid.width / Math.Max(1.0, (b1 - b0) * 1.15), MinZoom, MaxZoom);
+        _scrollBeats = (b0 + b1) * 0.5 - (double)_grid.width / _pxPerBeat * 0.5;
+        _rowH = Math.Clamp((double)_grid.height / (p1 - p0 + 7.0), MinRow, 14.0);
+        _lowPitch = (p0 + p1 + 1.0) * 0.5 - Rows() * 0.5;
+        StopGlide();
+        ClampView();
+    }
+
+    void FollowHead()
+    {
+        double visible = (double)_grid.width / _pxPerBeat;
+        double head = _app.head;
+        if (head < _scrollBeats || head > _scrollBeats + visible * 0.85) { _scrollBeats = Math.Max(0.0, head - visible * 0.1); }
+    }
+
+    void Navigate()
+    {
+        bool over = _grid.Contains(Ui.mouse) || _ruler.Contains(Ui.mouse) || _lane.Contains(Ui.mouse);
+        if (Ui.Free() && over && Ui.wheel != 0.0f)
+        {
+            double factor = Ui.wheel > 0.0f ? 1.15 : 1.0 / 1.15;
+            double notches = Math.Clamp((double)Ui.wheel, -3.0, 3.0);
+            if (Ui.alt || (Ui.ctrl && Ui.shift)) { ZoomRows(factor, Ui.mouse.y); }
+            else if (Ui.ctrl) { ZoomTime(factor, Ui.mouse.x); }
+            else if (Ui.shift) { _glideBeats -= notches * (double)_grid.width / _pxPerBeat * 0.12; }
+            else { _glidePitch += notches * 3.0; }
+        }
+        bool middle = Input.IsMouseButtonPressedThisFrame(MouseButton.Middle);
+        if (Ui.Free() && _grid.Contains(Ui.mouse) && (middle || (Ui.alt && Ui.pressed)))
+        {
+            Begin(Gesture.Pan);
+            _panButton = middle ? MouseButton.Middle : MouseButton.Left;
+            StopGlide();
+        }
+        if (_gesture == Gesture.Pan && !_ending)
+        {
+            _scrollBeats = _grabScroll - (double)(Ui.mouse.x - _grabMouse.x) / _pxPerBeat;
+            _lowPitch = _grabLow - (double)(Ui.mouse.y - _grabMouse.y) / _rowH;
+        }
+        double share = 1.0 - Math.Exp(-(double)Ui.dt * 20.0);
+        double beats = Math.Abs(_glideBeats) * _pxPerBeat < 0.25 ? _glideBeats : _glideBeats * share;
+        double pitches = Math.Abs(_glidePitch) * _rowH < 0.25 ? _glidePitch : _glidePitch * share;
+        _scrollBeats += beats;
+        _glideBeats -= beats;
+        _lowPitch += pitches;
+        _glidePitch -= pitches;
+        ClampView();
+    }
+
+    void EdgeScroll(bool vertical)
+    {
+        float margin = 8.0f;
+        double px = 0.0;
+        if (Ui.mouse.x > _grid.max.x - margin) { px = (double)(Ui.mouse.x - (_grid.max.x - margin)); }
+        else if (Ui.mouse.x < _grid.min.x + margin) { px = (double)(Ui.mouse.x - (_grid.min.x + margin)); }
+        double py = 0.0;
+        if (Ui.mouse.y > _grid.max.y - margin) { py = (double)(Ui.mouse.y - (_grid.max.y - margin)); }
+        else if (Ui.mouse.y < _grid.min.y + margin) { py = (double)(Ui.mouse.y - (_grid.min.y + margin)); }
+        _scrollBeats += Math.Clamp(px / 60.0, -1.0, 1.0) * (double)Ui.dt * (double)_grid.width / _pxPerBeat * 1.5;
+        if (vertical) { _lowPitch += Math.Clamp(py / 60.0, -1.0, 1.0) * (double)Ui.dt * Rows() * 1.5; }
+        ClampView();
+    }
+
+    void ScrollBars()
+    {
+        double start = _scrollBeats;
+        double span = (double)_grid.width / _pxPerBeat;
+        if (ScrollBar(_hbar, true, Gesture.ScrollTime, Gesture.ZoomTimeStart, Gesture.ZoomTimeEnd, Math.Max(_contentBeats, start + span),
+            (double)_grid.width / MaxZoom, (double)_grid.width / MinZoom, ref start, ref span))
+        {
+            _scrollBeats = start;
+            _pxPerBeat = (double)_grid.width / span;
+        }
+        Ui.Tip(_hbar, "Drag to move through the song, or drag either end of the thumb to zoom. Shift+wheel scrolls too, and middle-drag or Alt+drag pans.");
+
+        start = _lowPitch;
+        span = Rows();
+        if (ScrollBar(_vbar, false, Gesture.ScrollPitch, Gesture.ZoomPitchLow, Gesture.ZoomPitchHigh, 128.0,
+            (double)_grid.height / MaxRow, (double)_grid.height / MinRow, ref start, ref span))
+        {
+            _lowPitch = start;
+            _rowH = (double)_grid.height / span;
+        }
+        Ui.Tip(_vbar, "Drag to move through pitch, or drag either end of the thumb to change the row height. The wheel scrolls too.");
+        ClampView();
+    }
+
+    bool ScrollBar(Rect bar, bool horizontal, Gesture scroll, Gesture zoomLow, Gesture zoomHigh, double total, double minSpan, double maxSpan,
+        ref double start, ref double span)
+    {
+        bool dragging = _gesture == scroll || _gesture == zoomLow || _gesture == zoomHigh;
+        // Freeze the range during a drag to keep the thumb under the pointer.
+        if (dragging) { total = _barTotal; }
+        float barMin = horizontal ? bar.min.x : bar.min.y;
+        float barLength = horizontal ? bar.width : bar.height;
+        float mouse = horizontal ? Ui.mouse.x : Ui.mouse.y;
+        double at = (double)((mouse - barMin) / barLength) * total;
+
+        float t0 = barMin + barLength * (float)(start / total);
+        float t1 = Mathf.Max(t0 + 10.0f, barMin + barLength * (float)Math.Min(1.0, (start + span) / total));
+        float grip = Mathf.Min(6.0f, (t1 - t0) * 0.3f);
+        bool hot = dragging || (Ui.Free() && bar.Contains(Ui.mouse));
+        bar.Draw(Ui.Panel2, true);
+        Along(bar, horizontal, t0, t1).Draw(hot ? Ui.Dim : Ui.FieldHot, true);
+        Along(bar, horizontal, t0, t0 + grip).Draw(hot ? Ui.Text : Ui.Dim, true);
+        Along(bar, horizontal, t1 - grip, t1).Draw(hot ? Ui.Text : Ui.Dim, true);
+
+        if (Ui.Free() && bar.Contains(Ui.mouse) && Ui.pressed)
+        {
+            bool onThumb = mouse >= t0 && mouse <= t1;
+            _barTotal = total;
+            StopGlide();
+            if (onThumb && mouse <= t0 + grip)
+            {
+                Begin(zoomLow);
+                _barEdge = start + span;
+                _barOffset = at - start;
+            }
+            else if (onThumb && mouse >= t1 - grip)
+            {
+                Begin(zoomHigh);
+                _barEdge = start;
+                _barOffset = at - (start + span);
+            }
+            else
+            {
+                Begin(scroll);
+                if (!onThumb) { start = at - span * 0.5; }
+                _barStart = start;
+                return !onThumb;
+            }
+            return false;
+        }
+        if (!dragging || _ending) { return false; }
+        if (_gesture == scroll)
+        {
+            float grabbed = horizontal ? _grabMouse.x : _grabMouse.y;
+            start = _barStart + (double)((mouse - grabbed) / barLength) * total;
+            return true;
+        }
+        double end = Math.Clamp(at - _barOffset, 0.0, total);
+        span = Math.Clamp(_gesture == zoomHigh ? end - _barEdge : _barEdge - end, minSpan, maxSpan);
+        start = _gesture == zoomHigh ? _barEdge : _barEdge - span;
+        return true;
+    }
+
+    static Rect Along(Rect bar, bool horizontal, float from, float to)
+    {
+        return horizontal ? Rect(from, bar.min.y + 2.0f, to, bar.max.y - 2.0f) : Rect(bar.min.x + 2.0f, from, bar.max.x - 2.0f, to);
+    }
+
+    void Toolbar(Track t)
+    {
+        Rect bar = _toolbar;
+        _snap = Ui.Dropdown(bar.CutLeft(92.0f), WidgetId.Snap, SnapNames, _snap, "Grid snap for placing, moving and resizing notes.");
+        bar.CutLeft(4.0f);
+        _ghosts = Ui.Toggle(bar.CutLeft(62.0f), "Ghosts", _ghosts, "Show the other tracks' notes faintly.");
+        bar.CutLeft(4.0f);
+        _audition = Ui.Toggle(bar.CutLeft(70.0f), "Audition", _audition, "Play a note when you place it or change its pitch, for as long as you hold it.");
+        bar.CutLeft(4.0f);
+        _follow = Ui.Toggle(bar.CutLeft(60.0f), "Follow", _follow, "Scroll with the playhead.");
+        bar.CutLeft(4.0f);
+        if (Ui.Button(bar.CutLeft(26.0f), "-", false, "Zoom time out (-). Ctrl+wheel zooms time at the mouse.")) { ZoomAtHead(1.0 / 1.25); }
+        bar.CutLeft(2.0f);
+        if (Ui.Button(bar.CutLeft(26.0f), "+", false, "Zoom time in (+). Ctrl+wheel zooms time at the mouse.")) { ZoomAtHead(1.25); }
+        bar.CutLeft(2.0f);
+        if (Ui.Button(bar.CutLeft(34.0f), "Fit", false, "Show the whole song and every note of this track (F). Z frames just the selected notes.")) { Fit(); }
+        if (t == null) { return; }
+        ModuleDef def = t.instrument.def;
+        bar.CutLeft(10.0f);
+        Ui.Label(bar, t.name + "  -  " + (def != null ? def.label : t.instrument.kind), Ui.TrackColor(_app.trackIndex), 4.2f);
+        if (def == null) { return; }
+        Ui.Tip(bar, def.legato ? def.help + " A note that starts exactly where another ends continues its line and glides into it." : def.help);
+    }
+
+    void PlayKeys(Track t)
+    {
+        Rect corner = _corner;
+        corner.Grow(-1.0f);
+        string tip = "Row height. Also: Alt+wheel over the roll, or drag an end of the scrollbar on the right.";
+        if (Ui.SmallButton(corner.CutLeft(corner.width * 0.5f), "-", tip)) { ZoomRows(1.0 / 1.25, _grid.center.y); }
+        if (Ui.SmallButton(corner, "+", tip)) { ZoomRows(1.25, _grid.center.y); }
+
+        if (Ui.Free() && _keys.Contains(Ui.mouse) && Ui.pressed)
+        {
+            Begin(Gesture.PlayKeys);
+            _keyPitch = -1;
+        }
+        if (_gesture == Gesture.PlayKeys && !_ending)
+        {
+            int pitch = (int)Math.Clamp(Math.Floor(PitchAt(Ui.mouse.y)), 0.0, 127.0);
+            if (pitch != _keyPitch)
+            {
+                _keyPitch = pitch;
+                if (t != null) { _app.Preview(t, new Note(0.0, 4.0, (double)pitch, 1.0)); }
+            }
+        }
+        else { _keyPitch = -1; }
+        Ui.Tip(_keys, "Click or slide along the keys to hear them with this track's instrument.");
+    }
+
+    void DrawRows()
+    {
+        int rows = (int)Math.Ceiling(Rows()) + 2;
+        int firstPitch = (int)Math.Floor(_lowPitch);
+        _keys.Draw(Ui.Panel2, true);
+        RectCmd.SetClip(Rect(_keys.min.x, _grid.min.y, _grid.max.x, _grid.max.y));
+        for (int i = 0; i < rows; i++)
+        {
+            int pitch = firstPitch + i;
+            float y0 = _grid.min.y + (float)(((double)pitch - _lowPitch) * _rowH);
+            float y1 = y0 + (float)_rowH;
+            bool black = IsBlack(pitch);
+            if (black) { Rect(_grid.min.x, y0, _grid.max.x, y1).Draw(Color(0.0f, 0.0f, 0.0f, 0.18f), true); }
+            Rect key = Rect(_keys.min.x, y0, _keys.max.x, y1);
+            key.Draw(pitch == _keyPitch ? Ui.Accent : (black ? Color(0.1f, 0.105f, 0.12f, 1.0f) : Color(0.7f, 0.72f, 0.76f, 1.0f)), true);
+            if (pitch % 12 == 0)
+            {
+                Rect(_grid.min.x, y0, _grid.max.x, y0 + 1.0f).Draw(Ui.Line, true);
+                Ui.Label(key.Grow(0.0f, -2.0f, 0.0f, -2.0f), NoteName(pitch), Color(0.1f, 0.1f, 0.12f, 1.0f), 3.2f, HorizontalAlignment.Right);
+            }
+        }
+        RectCmd.ClearClip();
+    }
+
+    void DrawTimeline(Song song)
+    {
+        RectCmd.SetClip(Rect(_grid.min.x, _lane.min.y, _grid.max.x, _ruler.max.y));
+        _ruler.Draw(Ui.Panel2, true);
+        int perBar = song.beatsPerBar;
+        int firstBeat = (int)Math.Floor(_scrollBeats);
+        int lastBeat = firstBeat + (int)((double)_grid.width / _pxPerBeat) + 1;
+        bool everyBar = _pxPerBeat * (double)perBar > 26.0;
+        for (int beat = firstBeat; beat <= lastBeat; beat++)
+        {
+            float x = XAt((double)beat);
+            bool isBar = beat % perBar == 0;
+            Rect(x, _lane.min.y, x + 1.0f, _grid.max.y).Draw(Color(1.0f, 1.0f, 1.0f, isBar ? 0.13f : 0.045f), true);
+            int bar = beat / perBar;
+            if (isBar && (everyBar || bar % 4 == 0)) { Ui.Label(Rect(x + 3.0f, _ruler.min.y, x + 60.0f, _ruler.max.y), Number(bar + 1), Ui.Dim, 3.8f); }
+        }
+        float loopX = XAt(song.LoopBeats());
+        if (loopX < _grid.max.x)
+        {
+            Rect(loopX, _grid.min.y, _grid.max.x, _grid.max.y).Draw(Color(0.0f, 0.0f, 0.0f, 0.35f), true);
+            Rect(loopX - 1.0f, _lane.min.y, loopX + 1.0f, _ruler.max.y).Draw(Ui.Warn, true);
+        }
+        RectCmd.ClearClip();
+        Ruler();
+    }
+
+    void Ruler()
+    {
+        Ui.Tip(_ruler, "Bars. Click to move the playhead, drag sideways to scrub, drag down or up to zoom in or out. The orange line is the loop end.");
+        if (Ui.Free() && _ruler.Contains(Ui.mouse) && Ui.pressed)
+        {
+            Begin(Gesture.RulerClick);
+            _glideBeats = 0.0;
+        }
+        float dx = Ui.mouse.x - _grabMouse.x;
+        float dy = Ui.mouse.y - _grabMouse.y;
+        if (_gesture == Gesture.RulerClick)
+        {
+            if (_ending) { _app.Seek(Math.Max(0.0, Snap(_grabBeat))); }
+            else if (Mathf.Abs(dy) > 6.0f && Mathf.Abs(dy) > Mathf.Abs(dx)) { _gesture = Gesture.RulerZoom; }
+            else if (Mathf.Abs(dx) > 3.0f) { _gesture = Gesture.Scrub; }
+        }
+        if (_gesture == Gesture.RulerZoom)
+        {
+            _pxPerBeat = Math.Clamp(_grabZoom * Math.Exp((double)-dy * 0.012), MinZoom, MaxZoom);
+            _scrollBeats = _grabBeat - (double)(Ui.mouse.x - _grid.min.x) / _pxPerBeat;
+            ClampView();
+        }
+        else if (_gesture == Gesture.Scrub && !_ending)
+        {
+            double beat = Math.Max(0.0, Snap(BeatAt(Ui.mouse.x)));
+            if (beat != _app.cursor) { _app.Seek(beat); }
+        }
+    }
+
+    void DrawHead()
+    {
+        float x = XAt(_app.head);
+        if (x < _grid.min.x || x > _grid.max.x) { return; }
+        Rect(x - 1.0f, _lane.min.y, x + 1.0f, _ruler.max.y).Draw(_app.playing ? Ui.Accent : Ui.Alpha(Ui.Accent, 0.5f), true);
+    }
+
+    void DrawNotes(Song song, Track t)
+    {
+        RectCmd.SetClip(_grid);
+        if (_ghosts)
+        {
+            for (int ti = 0; ti < song.tracks.Count(); ti++)
+            {
+                if (ti == _app.trackIndex) { continue; }
+                List<Note> notes = song.tracks[ti].notes;
+                Color color = Ui.Alpha(Ui.TrackColor(ti), 0.22f);
+                for (int i = 0; i < notes.Count(); i++)
+                {
+                    Rect r = NoteRect(notes[i]);
+                    if (r.max.x >= _grid.min.x && r.min.x <= _grid.max.x) { r.Draw(color, true); }
+                }
+            }
+        }
+        if (t != null)
+        {
+            Color color = Ui.TrackColor(_app.trackIndex);
+            if (t.instrument.def != null && t.instrument.def.legato)
+            {
+                UpdateLinks(t);
+                for (int i = 0; i + 1 < _links.Count(); i += 2)
+                {
+                    Rect a = NoteRect(_links[i]);
+                    Rect b = NoteRect(_links[i + 1]);
+                    Rect(a.max.x - 1.0f, Mathf.Min(a.center.y, b.center.y), a.max.x + 1.0f, Mathf.Max(a.center.y, b.center.y)).Draw(Ui.Alpha(color, 0.8f), true);
+                }
+            }
+            bool labels = _rowH >= 8.0;
+            for (int i = 0; i < t.notes.Count(); i++)
+            {
+                Note n = t.notes[i];
+                Rect r = NoteRect(n);
+                if (r.max.x < _grid.min.x || r.min.x > _grid.max.x) { continue; }
+                r.Draw(Ui.Alpha(color, 0.45f + 0.55f * (float)Math.Min(1.0, n.velocity)), true);
+                if (_selection.Contains(n)) { r.Draw(Color.White, 1.5f); }
+                else { r.Draw(Color(0.0f, 0.0f, 0.0f, 0.5f), 1.0f); }
+                if (labels && r.width > 30.0f) { Ui.Label(r.Grow(0.0f, -2.0f, 0.0f, -3.0f), NoteName((int)Math.Round(n.pitch)), Color(0.05f, 0.05f, 0.06f, 0.9f), 2.9f); }
+            }
+        }
+        if (_gesture == Gesture.BoxSelect)
+        {
+            Rect box = BoxRect();
+            box.Draw(Ui.Alpha(Ui.Accent, 0.15f), true);
+            box.Draw(Ui.Accent, 1.0f);
+        }
+        RectCmd.ClearClip();
+    }
+
+    void UpdateLinks(Track t)
+    {
+        bool dragging = _gesture == Gesture.MoveNotes || _gesture == Gesture.ResizeNotes;
+        if (!dragging && _linksTrack == t && _linksSerial == _app.editSerial) { return; }
+        _linksTrack = t;
+        _linksSerial = dragging ? -1 : _app.editSerial;
+        _links.Clear();
+        List<List<Note>> phrases = SongRender.Phrases(SongRender.Sorted(t.notes));
+        for (int p = 0; p < phrases.Count(); p++)
+        {
+            for (int k = 0; k + 1 < phrases[p].Count(); k++)
+            {
+                _links.Add(phrases[p][k]);
+                _links.Add(phrases[p][k + 1]);
+            }
+        }
+    }
+
+    Rect BoxRect()
+    {
+        float x = XAt(_grabBeat);
+        float y = _grid.min.y + (float)((_grabPitch - _lowPitch) * _rowH);
+        return Rect(Mathf.Min(x, _heldMouse.x), Mathf.Min(y, _heldMouse.y), Mathf.Max(x, _heldMouse.x), Mathf.Max(y, _heldMouse.y));
+    }
+
+    void Audition(Track t, Note n)
+    {
+        if (_audition) { _app.Preview(t, n); }
+    }
+
+    void EditNotes(Track t)
+    {
+        bool inside = _grid.Contains(Ui.mouse);
+        if (Ui.Free() && inside && Ui.rightPressed)
+        {
+            Note hit = HitNote(t);
+            if (hit != null)
+            {
+                t.notes.Remove(hit);
+                _selection.Remove(hit);
+                _app.StopPreview();
+                _app.Commit();
+            }
+        }
+        if (Ui.Free() && inside && Ui.pressed) { Press(t); }
+
+        bool dragging = _gesture == Gesture.MoveNotes || _gesture == Gesture.ResizeNotes;
+        if ((dragging || _gesture == Gesture.BoxSelect) && !_ending) { EdgeScroll(_gesture != Gesture.ResizeNotes); }
+        if (_gesture == Gesture.MoveNotes && !_ending) { DragMove(t); }
+        if (_gesture == Gesture.ResizeNotes && !_ending) { DragResize(t); }
+        if (!_ending) { return; }
+
+        if (_gesture == Gesture.BoxSelect)
+        {
+            Rect box = BoxRect();
+            for (int i = 0; i < t.notes.Count(); i++)
+            {
+                if (box.Overlaps(NoteRect(t.notes[i])) && !_selection.Contains(t.notes[i])) { _selection.Add(t.notes[i]); }
+            }
+        }
+        if (!dragging) { return; }
+        if (_gesture == Gesture.ResizeNotes) { _lastLength = _dragNote.length; }
+        if (!_app.playing) { _app.cursor = _dragNote.start; }
+        if (_gesture == Gesture.MoveNotes && Moved()) { MakeRoom(t, _selection); }
+        _app.Commit();
+    }
+
+    void Press(Track t)
+    {
+        Note hit = HitNote(t);
+        if (hit == null && Ui.shift)
+        {
+            Begin(Gesture.BoxSelect);
+            return;
+        }
+        if (hit != null)
+        {
+            if (Ui.shift)
+            {
+                if (_selection.Contains(hit)) { _selection.Remove(hit); } else { _selection.Add(hit); }
+            }
+            else if (!_selection.Contains(hit))
+            {
+                _selection.Clear();
+                _selection.Add(hit);
+            }
+            Rect r = NoteRect(hit);
+            bool onEdge = Ui.mouse.x > r.max.x - Mathf.Clamp(r.width * 0.25f, 4.0f, 8.0f);
+            Begin(onEdge ? Gesture.ResizeNotes : Gesture.MoveNotes);
+            if (!onEdge && !Ui.shift) { Audition(t, hit); }
+        }
+        else
+        {
+            double at = BeatAt(Ui.mouse.x);
+            double start = Math.Max(0.0, Snap(at - SnapSize() * 0.5));
+            double pitch = Math.Floor(PitchAt(Ui.mouse.y));
+            double room = 1e9;
+            for (int i = 0; i < t.notes.Count(); i++)
+            {
+                Note other = t.notes[i];
+                if (other.pitch != pitch) { continue; }
+                if (other.start <= at) { start = Math.Max(start, other.End()); }
+                else { room = Math.Min(room, other.start); }
+            }
+            hit = new Note(start, Math.Max(ShortestNote, Math.Min(_lastLength, room - start)), pitch, 1.0);
+            t.notes.Add(hit);
+            _selection.Clear();
+            _selection.Add(hit);
+            Begin(Gesture.ResizeNotes);
+            Audition(t, hit);
+        }
+        _dragNote = hit;
+        _auditionedPitch = hit.pitch;
+        _beforeDrag = new double[_selection.Count() * 3];
+        for (int i = 0; i < _selection.Count(); i++)
+        {
+            _beforeDrag[i * 3] = _selection[i].start;
+            _beforeDrag[i * 3 + 1] = _selection[i].pitch;
+            _beforeDrag[i * 3 + 2] = _selection[i].length;
+        }
+    }
+
+    void DragMove(Track t)
+    {
+        double beats = BeatAt(Ui.mouse.x) - _grabBeat;
+        if (SnapSize() > 0.0) { beats = Math.Round(beats / SnapSize()) * SnapSize(); }
+        double pitches = Math.Round(PitchAt(Ui.mouse.y) - _grabPitch);
+        for (int i = 0; i < Dragged(); i++)
+        {
+            _selection[i].start = Math.Max(0.0, _beforeDrag[i * 3] + beats);
+            _selection[i].pitch = Math.Clamp(_beforeDrag[i * 3 + 1] + pitches, 0.0, 127.0);
+        }
+        if (_dragNote.pitch != _auditionedPitch)
+        {
+            _auditionedPitch = _dragNote.pitch;
+            Audition(t, _dragNote);
+        }
+    }
+
+    void DragResize(Track t)
+    {
+        double beats = BeatAt(Ui.mouse.x) - _grabBeat;
+        double shortest = SnapSize() > 0.0 ? SnapSize() : ShortestNote;
+        for (int i = 0; i < Dragged(); i++)
+        {
+            Note n = _selection[i];
+            double end = Snap(_beforeDrag[i * 3] + _beforeDrag[i * 3 + 2] + beats);
+            double room = NextStart(t, n) - n.start;
+            n.length = Math.Max(Math.Min(shortest, room), Math.Min(end - n.start, room));
+        }
+    }
+
+    // Keyboard shortcuts can change the selection mid-drag.
+    int Dragged() { return Math.Min(_selection.Count(), _beforeDrag.Length / 3); }
+
+    bool Moved()
+    {
+        for (int i = 0; i < Dragged(); i++)
+        {
+            if (_selection[i].start != _beforeDrag[i * 3] || _selection[i].pitch != _beforeDrag[i * 3 + 1]) { return true; }
+        }
+        return false;
+    }
+
+    void VelocityLane(Track t)
+    {
+        _lane.Draw(Ui.Panel2, true);
+        Rect inner = _lane;
+        inner.Grow(-3.0f, 0.0f, -3.0f, 0.0f);
+        RectCmd.SetClip(_lane);
+        Color color = Ui.TrackColor(_app.trackIndex);
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            Note n = t.notes[i];
+            float x = XAt(n.start);
+            if (x < _lane.min.x - 4.0f || x > _lane.max.x + 4.0f) { continue; }
+            float h = inner.height * (float)Math.Min(1.0, n.velocity);
+            Rect(x, inner.min.y, x + 3.0f, inner.min.y + h).Draw(_selection.Contains(n) ? Color.White : color, true);
+        }
+        RectCmd.ClearClip();
+        Ui.Tip(_lane, "Velocity: drag over the bars to set each note's level. With Shift, only the selected notes change.");
+        if (Ui.Free() && _lane.Contains(Ui.mouse) && Ui.pressed) { Begin(Gesture.Velocity); }
+        if (_gesture != Gesture.Velocity) { return; }
+        if (_ending)
+        {
+            _app.Commit();
+            return;
+        }
+        double velocity = Math.Clamp((double)((Ui.mouse.y - inner.min.y) / inner.height), 0.02, 1.0);
+        bool selectedOnly = Ui.shift && _selection.Count() > 0;
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            Note n = t.notes[i];
+            if (Mathf.Abs(XAt(n.start) + 1.5f - Ui.mouse.x) <= 5.0f && (!selectedOnly || _selection.Contains(n))) { n.velocity = velocity; }
+        }
+    }
+
+    void Paste(Track t)
+    {
+        double first = _clipboard[0].start;
+        for (int i = 1; i < _clipboard.Count(); i++) { first = Math.Min(first, _clipboard[i].start); }
+        double at = Snap(_app.head);
+        _selection.Clear();
+        int skipped = 0;
+        for (int i = 0; i < _clipboard.Count(); i++)
+        {
+            Note n = _clipboard[i].Copy();
+            n.start = n.start - first + at;
+            if (NoteAt(t, n.start, n.pitch) != null)
+            {
+                skipped++;
+                continue;
+            }
+            t.notes.Add(n);
+            _selection.Add(n);
+        }
+        if (skipped > 0)
+        {
+            _app.Flash(_selection.Count() > 0 ? $"Pasted {_selection.Count()} notes, {skipped} were already there"
+                : "Those notes are already there: move the playhead to paste elsewhere");
+        }
+        MakeRoom(t, _selection);
+        _app.Commit();
+    }
+
+    void Duplicate(Track t)
+    {
+        double lo = _selection[0].start;
+        double hi = _selection[0].End();
+        for (int i = 1; i < _selection.Count(); i++)
+        {
+            lo = Math.Min(lo, _selection[i].start);
+            hi = Math.Max(hi, _selection[i].End());
+        }
+        List<Note> copies = new List<Note>();
+        for (int i = 0; i < _selection.Count(); i++)
+        {
+            Note n = _selection[i].Copy();
+            n.start += hi - lo;
+            Note there = NoteAt(t, n.start, n.pitch);
+            if (there == null) { t.notes.Add(n); }
+            copies.Add(there != null ? there : n);
+        }
+        _selection = copies;
+        MakeRoom(t, _selection);
+        _app.Commit();
+    }
+
+    static Note NoteAt(Track t, double start, double pitch)
+    {
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            if (t.notes[i].pitch == pitch && Math.Abs(t.notes[i].start - start) < 1e-6) { return t.notes[i]; }
+        }
+        return null;
+    }
+
+    Note HitNote(Track t)
+    {
+        for (int i = t.notes.Count() - 1; i >= 0; i--)
+        {
+            if (NoteRect(t.notes[i]).Grow(1.0f).Contains(Ui.mouse)) { return t.notes[i]; }
+        }
+        return null;
+    }
+
+    double NextStart(Track t, Note n)
+    {
+        double next = 1e9;
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            Note other = t.notes[i];
+            if (other == n || other.pitch != n.pitch || other.start <= n.start || _selection.Contains(other)) { continue; }
+            next = Math.Min(next, other.start);
+        }
+        return next;
+    }
+
+    int MakeRoom(Track t, List<Note> moved)
+    {
+        int changed = 0;
+        for (int m = 0; m < moved.Count(); m++)
+        {
+            Note top = moved[m];
+            if (!t.notes.Contains(top)) { continue; }
+            for (int i = t.notes.Count() - 1; i >= 0; i--)
+            {
+                Note under = t.notes[i];
+                if (under.pitch != top.pitch || moved.Contains(under)) { continue; }
+                if (under.End() <= top.start + 1e-6 || under.start >= top.End() - 1e-6) { continue; }
+                if (under.start < top.start - 1e-6) { under.length = top.start - under.start; }
+                else if (under.End() > top.End() + 1e-6)
+                {
+                    double end = under.End();
+                    under.start = top.End();
+                    under.length = end - under.start;
+                }
+                else
+                {
+                    t.notes.RemoveAt(i);
+                    _selection.Remove(under);
+                }
+                changed++;
+            }
+        }
+        if (changed > 0) { _app.Flash(changed == 1 ? "Made room: 1 note underneath trimmed or removed" : $"Made room: {changed} notes underneath trimmed or removed"); }
+        return changed;
+    }
+
+    void Settle()
+    {
+        if (_settleTrack == null || Time.ElapsedTime() < _settleAt || Ui.down) { return; }
+        if (Input.IsKeyPressed(KeyCode.Up) || Input.IsKeyPressed(KeyCode.Down) || Input.IsKeyPressed(KeyCode.Left) || Input.IsKeyPressed(KeyCode.Right)) { return; }
+        Track t = _settleTrack;
+        _settleTrack = null;
+        if (!_app.song.tracks.Contains(t)) { return; }
+        if (MakeRoom(t, _settle) > 0) { _app.Commit(); }
+    }
+
+    static bool IsBlack(int pitch)
+    {
+        int k = pitch % 12;
+        return k == 1 || k == 3 || k == 6 || k == 8 || k == 10;
+    }
+
+    static string NoteName(int pitch) { return pitch >= 0 && pitch < 128 ? s_noteNames[pitch] : ""; }
+
+    static string Number(int n)
+    {
+        while (s_numbers.Count() <= n) { s_numbers.Add($"{s_numbers.Count()}"); }
+        return n >= 0 ? s_numbers[n] : "";
+    }
+}

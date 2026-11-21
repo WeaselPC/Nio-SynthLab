@@ -1,0 +1,949 @@
+using NioEngine;
+
+public static class WidgetId
+{
+    public const int Bpm = 1;
+    public const int Bars = 2;
+    public const int Meter = 3;
+    public const int Tail = 4;
+    public const int Seed = 5;
+    public const int Volume = 6;
+    public const int OpenMenu = 7;
+    public const int AddTrack = 8;
+    public const int Snap = 9;
+
+    public const int FinishBlock = 1;
+    public const int InstrumentBlock = 2;
+    public const int MixerBlock = 3;
+    public const int TrackEffectBlock = 4;
+    public const int MasterEffectBlock = 5;
+    public const int MenuSlot = 63;
+
+    public static int Param(int block, int track, int module, int param)
+    {
+        return ((block * 1024 + track) * 64 + module) * 64 + param;
+    }
+}
+
+public class SynthLabApp : Entity
+{
+    enum Transport { Stopped, WaitingForBake, Playing }
+    enum Tab { Track, Master }
+
+    struct Panels
+    {
+        public Rect top;
+        public Rect status;
+        public Rect tracks;
+        public Rect inspector;
+        public Rect wave;
+        public Rect roll;
+    }
+
+    const string LastSongPref = "synthlab.last";
+    const string AutosavePref = "synthlab.autosave";
+    const string VolumePref = "synthlab.volume";
+
+    const double BakeFps = 30.0;
+    const double FrameMs = 1000.0 / BakeFps;
+
+    static ParamDef GainParam = new ParamDef("gain", "Gain (dB)", ParamKind.Linear, -60.0, 12.0, -18.0);
+    static ParamDef TailParam = new ParamDef("tail", "Note tail (s)", ParamKind.Linear, 0.0, 12.0, 0.5);
+
+    Song _song;
+    int _track;
+    PianoRoll _roll;
+    LoopPlayer _player;
+    SongRender _render = new SongRender();
+
+    List<string> _undo = new List<string>();
+    List<string> _redo = new List<string>();
+    string _committed = "";
+    int _editSerial;
+    float _lastEdit;
+
+    BakeJob _job;
+    Signal _baked;
+    int _bakedSerial = -1;
+    double _bakedSeconds;
+    double _bakedBeat = 1.0;
+    string _stats = "";
+    double _bakeReserve = 3.0;
+    double _frameStart;
+    double _sliceBudget;
+    double _sliceMs = -1.0;
+
+    Transport _transport = Transport.Stopped;
+    double _cursorBeats;
+    bool _live = true;
+    double _volume = 0.8;
+
+    AudioComponent _preview;
+    AudioFile _previewClip;
+    bool _previewing;
+
+    float[] _waveMin;
+    float[] _waveMax;
+
+    string _status = "";
+    float _statusUntil;
+
+    string _currentFile = "";
+    string[] _files = [];
+    string[] _openMenu = [];
+    InvokeHandle _filesTimer;
+    string _savedText = "";
+    string _autosaved = "";
+    string _autosavePath = "";
+
+    Texture _logo;
+    InputFieldState _nameField;
+    InputFieldState _trackField;
+    Tab _tab = Tab.Track;
+    ScrollViewState _trackView;
+    ScrollViewState _inspectorView;
+    float _inspectorHeight;
+    List<string> _trackInfo = new List<string>();
+    int _trackInfoSerial = -1;
+
+    public override void OnStart()
+    {
+        _player = new LoopPlayer();
+        _roll = new PianoRoll(this);
+        Entity preview = Entity.Create(Vec2f.Zero);
+        preview.name = "Synth Lab preview";
+        _preview = preview.AddComponent<AudioComponent>();
+
+        _logo = Resources.Load<Texture>("Textures/AppIcon.png");
+        _nameField = InputFieldState.GetDefault();
+        _nameField.textColor = Ui.Text;
+        _trackField = InputFieldState.GetDefault();
+        _trackField.textColor = Ui.Text;
+        _trackView = Ui.ScrollView();
+        _inspectorView = Ui.ScrollView();
+        _volume = (double)Prefs.GetFloat(VolumePref, 0.8f);
+        _player.Volume = _volume;
+
+        Directory.CreateDirectory(SongsDir());
+        for (int i = 0; i < Presets.Count(); i++)
+        {
+            string path = Path.Combine(SongsDir(), SongFile.FileName(Presets.Name(i)));
+            if (!File.Exists(path)) { File.WriteAllText(path, SongFile.Write(Presets.Make(i))); }
+        }
+        RefreshFiles();
+        _filesTimer = Invoke.Every(3.0f, () => RefreshFiles());
+
+        _roll.Place(Layout().roll);
+        string unsaved = Prefs.GetString(AutosavePref, "");
+        string last = Prefs.GetString(LastSongPref, "");
+        if (unsaved != "" && File.Exists(unsaved) && Recover(unsaved)) { return; }
+        if (last != "" && File.Exists(last)) { LoadFile(last); }
+        if (_song == null) { SetSong(Presets.First(), ""); }
+    }
+
+    public override void OnDestroy()
+    {
+        _filesTimer.Cancel();
+    }
+
+    public override void OnUpdate(float deltaTime)
+    {
+        _frameStart = Clock();
+        Panels panels = Layout();
+        _roll.Place(panels.roll);
+        _player.Update();
+
+        Ui.Begin(deltaTime);
+        Screen.GetUIRect().Draw(Ui.Bg, true);
+        if (!_nameField.isSelected && !_trackField.isSelected && !Ui.Typing())
+        {
+            Shortcuts();
+            _roll.Shortcuts();
+        }
+        TopBar(panels.top);
+        StatusBar(panels.status);
+        TrackList(panels.tracks);
+        Inspector(panels.inspector);
+        Waveform(panels.wave);
+        _roll.Update();
+        Ui.End();
+
+        if (Ui.committed) { Commit(); }
+        StopPreviewWhenReleased();
+        Autosave();
+        Bake((double)deltaTime * 1000.0);
+    }
+
+    static Panels Layout()
+    {
+        Rect screen = Screen.GetUIRect();
+        Panels panels = Panels();
+        panels.top = screen.CutTop(44.0f);
+        panels.status = screen.CutBottom(22.0f);
+        screen.Grow(-Ui.Gap);
+        panels.tracks = screen.CutLeft(206.0f);
+        screen.CutLeft(Ui.Gap);
+        panels.inspector = screen.CutRight(322.0f);
+        screen.CutRight(Ui.Gap);
+        panels.wave = screen.CutBottom(50.0f);
+        screen.CutBottom(Ui.Gap);
+        panels.roll = screen;
+        return panels;
+    }
+
+    void Shortcuts()
+    {
+        if (Input.IsKeyPressedThisFrame(KeyCode.Space)) { TogglePlay(); }
+        if (Ui.ctrl && Input.IsKeyPressedThisFrame(KeyCode.Z)) { if (Ui.shift) { Redo(); } else { Undo(); } }
+        if (Ui.ctrl && Input.IsKeyPressedThisFrame(KeyCode.Y)) { Redo(); }
+        if (Ui.ctrl && Input.IsKeyPressedThisFrame(KeyCode.S))
+        {
+            if (Ui.shift && Presets.CanSave()) { SavePreset(); }
+            else { Save(); }
+        }
+    }
+
+    internal Song song => _song;
+    internal Track track => Current();
+    internal int trackIndex => _track;
+    internal int editSerial => _editSerial;
+    internal bool playing => _transport == Transport.Playing;
+    internal double head => playing ? _player.Beats : _cursorBeats;
+
+    internal double cursor
+    {
+        get { return _cursorBeats; }
+        set { _cursorBeats = value; }
+    }
+
+    void SetSong(Song song, string file)
+    {
+        StopPlayback();
+        _job = null;
+        _song = song;
+        _currentFile = file;
+        _track = 0;
+        _render.Forget();
+        _undo.Clear();
+        _redo.Clear();
+        _committed = SongFile.Write(_song);
+        _savedText = _committed;
+        _autosaved = _committed;
+        _autosavePath = "";
+        _editSerial++;
+        _cursorBeats = 0.0;
+        _waveMin = null;
+        _waveMax = null;
+        _baked = null;
+        _stats = "";
+        _roll.ClearSelection();
+        _roll.Fit();
+    }
+
+    Track Current()
+    {
+        if (_song.tracks.Count() == 0) { return null; }
+        _track = Mathf.Clamp(_track, 0, _song.tracks.Count() - 1);
+        return _song.tracks[_track];
+    }
+
+    internal void Commit()
+    {
+        string text = SongFile.Write(_song);
+        if (text == _committed) { return; }
+        _undo.Add(_committed);
+        if (_undo.Count() > 200) { _undo.RemoveAt(0); }
+        _redo.Clear();
+        _committed = text;
+        _editSerial++;
+        _lastEdit = Time.ElapsedTime();
+    }
+
+    void Restore(string text)
+    {
+        Song restored = SongFile.Read(text);
+        if (restored == null) { return; }
+        _song = restored;
+        _committed = text;
+        _roll.ClearSelection();
+        _editSerial++;
+        _lastEdit = Time.ElapsedTime();
+    }
+
+    void Undo()
+    {
+        if (_undo.Count() == 0) { return; }
+        _redo.Add(_committed);
+        Restore(_undo.RemoveAt(_undo.Count() - 1));
+        Flash("Undo");
+    }
+
+    void Redo()
+    {
+        if (_redo.Count() == 0) { return; }
+        _undo.Add(_committed);
+        Restore(_redo.RemoveAt(_redo.Count() - 1));
+        Flash("Redo");
+    }
+
+    internal void Flash(string message)
+    {
+        _status = message;
+        _statusUntil = Time.ElapsedTime() + 4.0f;
+    }
+
+    string SongsDir() { return Path.Combine(Project.runtimeDirectory, "Songs"); }
+    string AutosaveDir() { return Path.Combine(SongsDir(), "Autosave"); }
+
+    void RefreshFiles()
+    {
+        _files = Directory.GetFiles(SongsDir(), "*" + SongFile.Extension);
+        int actions = Presets.CanSave() ? 3 : 2;
+        _openMenu = new string[actions + _files.Length];
+        _openMenu[0] = "New song";
+        _openMenu[1] = "Revert to saved";
+        if (actions > 2) { _openMenu[2] = "Save as preset"; }
+        for (int i = 0; i < _files.Length; i++) { _openMenu[actions + i] = Path.GetFileNameWithoutExtension(_files[i]); }
+    }
+
+    void LoadFile(string path, bool saved = false)
+    {
+        Song loaded = SongFile.Read(File.ReadAllText(path));
+        if (loaded == null)
+        {
+            Flash("Could not open " + Path.GetFileName(path) + ": it is not a Synth Lab song");
+            return;
+        }
+        string onDisk = SongFile.Write(loaded);
+        string copy = Path.Combine(AutosaveDir(), Path.GetFileName(path));
+        bool recovered = false;
+        if (File.Exists(copy))
+        {
+            Song unsaved = saved ? null : SongFile.Read(File.ReadAllText(copy));
+            if (unsaved != null && SongFile.Write(unsaved) != onDisk)
+            {
+                loaded = unsaved;
+                recovered = true;
+            }
+            else { File.Delete(copy); }
+        }
+        SetSong(loaded, path);
+        _savedText = onDisk;
+        if (recovered) { _autosavePath = copy; }
+        Prefs.SetString(LastSongPref, path);
+        Prefs.SetString(AutosavePref, recovered ? copy : "");
+        Flash(recovered ? "Recovered unsaved changes to " + Path.GetFileNameWithoutExtension(path) + ". Open > Revert to saved drops them."
+            : "Opened " + Path.GetFileName(path));
+    }
+
+    bool Recover(string copy)
+    {
+        string saved = Path.Combine(SongsDir(), Path.GetFileName(copy));
+        if (File.Exists(saved))
+        {
+            LoadFile(saved);
+            return _song != null;
+        }
+        Song unsaved = SongFile.Read(File.ReadAllText(copy));
+        if (unsaved == null) { return false; }
+        SetSong(unsaved, "");
+        _savedText = "";
+        _autosavePath = copy;
+        Flash("Recovered " + unsaved.name + ", which was never saved");
+        return true;
+    }
+
+    void Autosave()
+    {
+        if (_committed == _autosaved || Ui.down || Time.ElapsedTime() - _lastEdit < 1.0f) { return; }
+        _autosaved = _committed;
+        string copy = Path.Combine(AutosaveDir(), SongFile.FileName(_song.name));
+        if (_autosavePath != "" && _autosavePath != copy) { File.Delete(_autosavePath); }
+        _autosavePath = "";
+        if (_committed == _savedText)
+        {
+            File.Delete(copy);
+            Prefs.SetString(AutosavePref, "");
+            return;
+        }
+        Directory.CreateDirectory(AutosaveDir());
+        if (File.WriteAllText(copy, _committed))
+        {
+            _autosavePath = copy;
+            Prefs.SetString(AutosavePref, copy);
+        }
+    }
+
+    void Save()
+    {
+        Directory.CreateDirectory(SongsDir());
+        string path = Path.Combine(SongsDir(), SongFile.FileName(_song.name));
+        string text = SongFile.Write(_song);
+        if (!File.WriteAllText(path, text))
+        {
+            Flash("Could not save " + path);
+            return;
+        }
+        _currentFile = path;
+        _savedText = text;
+        if (_autosavePath != "") { File.Delete(_autosavePath); }
+        File.Delete(Path.Combine(AutosaveDir(), Path.GetFileName(path)));
+        _autosavePath = "";
+        _autosaved = text;
+        Prefs.SetString(LastSongPref, path);
+        Prefs.SetString(AutosavePref, "");
+        Flash("Saved Songs/" + Path.GetFileName(path));
+        RefreshFiles();
+    }
+
+    void SavePreset()
+    {
+        Save();
+        if (Presets.Save(_song)) { Flash("Saved Songs/" + SongFile.FileName(_song.name) + " and made it a preset (Assets/Presets/PresetData.ns)"); }
+        else { Flash("Could not write Assets/Presets/PresetData.ns"); }
+    }
+
+    void Revert()
+    {
+        if (_currentFile == "" || !File.Exists(_currentFile))
+        {
+            Flash("This song has not been saved yet");
+            return;
+        }
+        string path = _currentFile;
+        if (_autosavePath != "") { File.Delete(_autosavePath); }
+        LoadFile(path, true);
+        Flash("Reverted to the saved " + Path.GetFileNameWithoutExtension(path));
+    }
+
+    void Export()
+    {
+        if (_baked == null || _bakedSerial != _editSerial) { BakeNow(); }
+        string file = Path.ChangeExtension(SongFile.FileName(_song.name), ".wav");
+        bool loop = _song.finish.Get("fold") > 0.5;
+        if (_baked.SaveWav("Audio/" + file, loop)) { Flash("Exported Assets/Audio/" + file); }
+        else { Flash("Export failed"); }
+    }
+
+    void Bake(double lastFrameMs)
+    {
+        int latest = _job != null ? _job.serial : _bakedSerial;
+        bool rested = !Ui.down && Time.ElapsedTime() - _lastEdit > 0.25f;
+        if ((_live || !playing) && _editSerial != latest && rested) { RequestBake(); }
+
+        // Crossfade gains update each frame.
+        if (_job == null || _player.Crossfading)
+        {
+            _sliceMs = -1.0;
+            return;
+        }
+        _sliceBudget = SliceBudget(lastFrameMs);
+        double start = Clock();
+        bool finished = _job.Run(_sliceBudget);
+        _sliceMs = (Clock() - start) * 1000.0;
+        if (finished) { FinishJob(); }
+    }
+
+    double SliceBudget(double lastFrameMs)
+    {
+        if (_sliceMs >= 0.0)
+        {
+            bool late = lastFrameMs > FrameMs + 1.0;
+            // Ignore bake overruns and large hitches when estimating engine overhead.
+            if (late && _sliceMs <= _sliceBudget + 1.0 && lastFrameMs < FrameMs * 3.0) { _bakeReserve = Math.Min(12.0, _bakeReserve + 1.0); }
+            else if (!late) { _bakeReserve = Math.Max(3.0, _bakeReserve - 0.01); }
+        }
+        double drawn = (Clock() - _frameStart) * 1000.0;
+        return Math.Max(1.0, FrameMs - drawn - _bakeReserve);
+    }
+
+    void RequestBake()
+    {
+        _job = _render.Begin(_song.Copy());
+        _job.serial = _editSerial;
+    }
+
+    void BakeNow()
+    {
+        RequestBake();
+        while (!_job.Step()) { }
+        FinishJob();
+    }
+
+    void FinishJob()
+    {
+        BakeJob job = _job;
+        _job = null;
+        _baked = job.result;
+        _bakedSerial = job.serial;
+        _bakedSeconds = _baked.Duration;
+        _bakedBeat = job.song.Beat();
+        _waveMin = null;
+        _stats = $"Baked in {job.workMs:F0} ms (tracks: {job.rendered} rendered, {job.cached} from cache)   {_bakedSeconds:F1} s   rms {job.rms:F3}   peak {job.peak:F3}   {job.lufs:F1} LUFS";
+        if (_transport == Transport.Playing)
+        {
+            if (!_player.Swap(_baked, _bakedBeat, _song.name)) { NoVoice(); }
+        }
+        else if (_transport == Transport.WaitingForBake) { StartPlayback(); }
+    }
+
+    void MakeWave(Signal s, int columns)
+    {
+        _waveMin = new float[columns];
+        _waveMax = new float[columns];
+        float[] x = s.samples;
+        int perColumn = Math.Max(1, x.Length / columns);
+        int stride = 7;
+        for (int c = 0; c < columns; c++)
+        {
+            float lo = 0.0f;
+            float hi = 0.0f;
+            int end = Math.Min(x.Length, (c + 1) * perColumn);
+            for (int i = c * perColumn; i < end; i += stride)
+            {
+                float v = x[i];
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+            }
+            _waveMin[c] = lo;
+            _waveMax[c] = hi;
+        }
+    }
+
+    void TogglePlay()
+    {
+        switch (_transport)
+        {
+            case Transport.Playing:
+                _cursorBeats = _player.Beats;
+                StopPlayback();
+                break;
+            case Transport.WaitingForBake:
+                _transport = Transport.Stopped;
+                break;
+            case Transport.Stopped:
+                if (_baked != null && _bakedSerial == _editSerial) { StartPlayback(); }
+                else
+                {
+                    _transport = Transport.WaitingForBake;
+                    if (_job == null || _job.serial != _editSerial) { RequestBake(); }
+                }
+                break;
+        }
+    }
+
+    void StartPlayback()
+    {
+        if (_player.Play(_baked, _bakedBeat, _song.name, _cursorBeats)) { _transport = Transport.Playing; }
+        else { NoVoice(); }
+    }
+
+    void StopPlayback()
+    {
+        _player.Stop();
+        _transport = Transport.Stopped;
+    }
+
+    void NoVoice()
+    {
+        StopPlayback();
+        Flash("No music voice available");
+    }
+
+    internal void Seek(double beats)
+    {
+        _cursorBeats = Math.Max(0.0, beats);
+        if (playing && !_player.Seek(_cursorBeats)) { NoVoice(); }
+    }
+
+    internal void Preview(Track t, Note n)
+    {
+        Note heard = n.Copy();
+        heard.length = Math.Min(n.length, 8.0);
+        AudioFile old = _previewClip;
+        _previewClip = SongRender.Preview(_song, t, heard).ToAudio(false, "preview");
+        _preview.audio = _previewClip;
+        _preview.volume = (float)_volume;
+        _preview.Play();
+        _previewing = true;
+        // The audio thread may still have a queued Play for the old clip.
+        if (old != null) { Invoke.After(0.5f, () => Synth.ReleaseAudio(old)); }
+    }
+
+    internal void StopPreview()
+    {
+        if (!_previewing) { return; }
+        _preview.Stop();
+        _previewing = false;
+    }
+
+    void StopPreviewWhenReleased()
+    {
+        if (!Ui.down && !Input.IsKeyPressed(KeyCode.Up) && !Input.IsKeyPressed(KeyCode.Down)) { StopPreview(); }
+    }
+
+    void TopBar(Rect r)
+    {
+        r.Draw(Ui.Panel, true);
+        r.CutBottom(1.0f).Draw(Ui.Line, true);
+        r.Grow(-7.0f, -Ui.Gap, -7.0f, -Ui.Gap);
+        if (_logo != null)
+        {
+            Rect logo = r.CutLeft(34.0f);
+            logo.Grow(2.0f, 0.0f, 2.0f, 0.0f).DrawImage(_logo);
+            r.CutLeft(8.0f);
+        }
+        else { Ui.Label(r.CutLeft(92.0f), "SYNTH LAB", Ui.Accent, 5.4f); }
+
+        Rect name = r.CutLeft(190.0f);
+        if (!_nameField.isSelected) { _nameField.currentValue = _song.name; }
+        bool renamed = Ui.TextField(name, ref _nameField);
+        if (_nameField.currentValue.Trim() != "") { _song.name = _nameField.currentValue; }
+        if (renamed) { Commit(); }
+        Ui.Tip(name, "Song name; also the file name when saving and exporting.");
+        r.CutLeft(8.0f);
+
+        _song.bpm = Ui.Number(r.CutLeft(86.0f), WidgetId.Bpm, "BPM", _song.bpm, 20.0, 300.0, 1.0, 0, "Tempo. Drag sideways or scroll; Shift for slower dragging.");
+        r.CutLeft(4.0f);
+        _song.bars = (int)Ui.Number(r.CutLeft(70.0f), WidgetId.Bars, "Bars", (double)_song.bars, 1.0, 256.0, 1.0, 0, "Loop length in bars.");
+        r.CutLeft(4.0f);
+        _song.beatsPerBar = (int)Ui.Number(r.CutLeft(66.0f), WidgetId.Meter, "Beats", (double)_song.beatsPerBar, 1.0, 16.0, 1.0, 0, "Beats per bar.");
+        r.CutLeft(4.0f);
+        _song.tail = Ui.Number(r.CutLeft(72.0f), WidgetId.Tail, "Tail", _song.tail, 0.0, 60.0, 0.5, 1,
+            "Seconds rendered past the loop end; with Fold on, the tail wraps onto the start so the loop is seamless.");
+        r.CutLeft(4.0f);
+        _song.seed = (long)Ui.Number(r.CutLeft(78.0f), WidgetId.Seed, "Seed", (double)_song.seed, 0.0, 99999.0, 1.0, 0,
+            "Random seed for noise, detune and chorus. The same seed gives the same bake.");
+
+        bool waiting = _transport == Transport.WaitingForBake;
+        string playLabel = playing ? "Stop" : (waiting && _job != null ? $"Baking {_job.Progress() * 100.0:F0}%" : "Play");
+        if (Ui.Button(r.CutRight(92.0f), playLabel, playing || waiting,
+            "Play the loop (Space). The song bakes in the background when it is opened and after every edit, so this only waits if that bake is still running.")) { TogglePlay(); }
+        r.CutRight(4.0f);
+        _live = Ui.Toggle(r.CutRight(52.0f), "Live", _live,
+            "While playing, re-bake after every edit and keep playing from the same spot. Off: edits made while playing are baked once you stop.");
+        r.CutRight(4.0f);
+        double volume = Ui.Number(r.CutRight(78.0f), WidgetId.Volume, "Vol", _volume * 100.0, 0.0, 100.0, 5.0, 0, "Playback volume (not part of the song).") / 100.0;
+        if (volume != _volume)
+        {
+            _volume = volume;
+            _player.Volume = volume;
+            Prefs.SetFloat(VolumePref, (float)volume);
+        }
+        r.CutRight(10.0f);
+        if (Ui.Button(r.CutRight(82.0f), "Export WAV", false, "Write the baked loop to Assets/Audio/<name>.wav, imported looping when Fold is on.")) { Export(); }
+        r.CutRight(4.0f);
+        if (Ui.Button(r.CutRight(56.0f), _committed != _savedText ? "Save *" : "Save", false,
+            "Save to Songs/<name>.synth (Ctrl+S); the star means there are unsaved changes. Unsaved work is also autosaved to Songs/Autosave and comes back the next time the song opens. Rename the song first to save it as a copy.")) { Save(); }
+        r.CutRight(4.0f);
+
+        int actions = Presets.CanSave() ? 3 : 2;
+        string tip = "Open a song from Songs/, start an empty one, or go back to the saved version of this one. A song with autosaved unsaved changes opens with them. The built-in songs come back if you delete their files.";
+        if (actions > 2) { tip += " Save as preset (Ctrl+Shift+S, editor only) saves the song and makes it a built-in one, replacing the preset of that name. Presets are kept in the generated script Assets/Presets/PresetData.ns, so a build has it after the next script compile."; }
+        int pick = Ui.Menu(r.CutRight(64.0f), WidgetId.OpenMenu, "Open", _openMenu, tip);
+        if (pick == 0)
+        {
+            SetSong(Presets.NewSong(), "");
+            Flash("New song");
+        }
+        else if (pick == 1) { Revert(); }
+        else if (pick == 2 && actions > 2) { SavePreset(); }
+        else if (pick >= actions) { LoadFile(_files[pick - actions]); }
+    }
+
+    void StatusBar(Rect r)
+    {
+        r.Draw(Ui.Panel, true);
+        r.CutTop(1.0f).Draw(Ui.Line, true);
+        r.Grow(0.0f, -Ui.Gap, 0.0f, -Ui.Gap);
+        int bar = (int)Math.Floor(head / (double)_song.beatsPerBar);
+        Ui.Label(r.CutRight(140.0f), $"bar {bar + 1}  beat {head - (double)(bar * _song.beatsPerBar) + 1.0:F2}", Ui.Dim, 4.2f, HorizontalAlignment.Right);
+
+        bool flashing = Time.ElapsedTime() < _statusUntil;
+        string text = flashing ? _status : _stats;
+        if (_job != null)
+        {
+            Rect meter = r.CutLeft(120.0f).Grow(0.0f, -7.0f, 0.0f, -7.0f);
+            meter.Draw(Ui.Field, true);
+            meter.CutLeft(meter.width * (float)_job.Progress()).Draw(Ui.Accent, true);
+            r.CutLeft(8.0f);
+            text = $"Baking {_job.Progress() * 100.0:F0}%" + (playing ? ", the last bake keeps playing" : "");
+        }
+        else if (!flashing && _baked != null && _bakedSerial != _editSerial) { text += "   (edited since bake)"; }
+        Ui.Label(r, text, flashing ? Ui.Accent : Ui.Dim, 4.2f);
+    }
+
+    void TrackList(Rect r)
+    {
+        Ui.Box(r, Ui.Panel, Ui.Line);
+        r.Grow(-Ui.Pad);
+        Rect head = r.CutTop(20.0f);
+        r.CutTop(Ui.Pad);
+        int added = Ui.Menu(head.CutRight(64.0f), WidgetId.AddTrack, "+ Track", Catalog.InstrumentLabels(), "Add a track playing the chosen instrument.");
+        head.CutLeft(Ui.Pad);
+        Ui.Label(head, "TRACKS", Ui.Dim, 4.4f);
+        if (added >= 0)
+        {
+            ModuleDef def = Catalog.Instruments()[added];
+            Track t = _song.AddTrack(def.label, def.kind);
+            t.gain = 0.12;
+            t.tail = def.legato ? 0.0 : 0.4;
+            _track = _song.tracks.Count() - 1;
+            _roll.ClearSelection();
+            Commit();
+        }
+
+        Rect foot = r.CutBottom(20.0f);
+        r.CutBottom(Ui.Pad);
+        float w = (foot.width - 9.0f) / 4.0f;
+        Track current = Current();
+        if (Ui.Button(foot.CutLeft(w), "Dup", false, "Duplicate the track.") && current != null)
+        {
+            Track copy = current.Copy();
+            copy.name = current.name + " copy";
+            _song.tracks.Insert(_track + 1, copy);
+            _track++;
+            Commit();
+        }
+        foot.CutLeft(3.0f);
+        if (Ui.Button(foot.CutLeft(w), "Del", false, "Delete the track.") && current != null)
+        {
+            _song.tracks.RemoveAt(_track);
+            _roll.ClearSelection();
+            Commit();
+        }
+        foot.CutLeft(3.0f);
+        if (Ui.Button(foot.CutLeft(w), "Up", false, "Move the track up.") && current != null && _track > 0)
+        {
+            _song.tracks.RemoveAt(_track);
+            _song.tracks.Insert(_track - 1, current);
+            _track--;
+            Commit();
+        }
+        foot.CutLeft(3.0f);
+        if (Ui.Button(foot, "Down", false, "Move the track down.") && current != null && _track + 1 < _song.tracks.Count())
+        {
+            _song.tracks.RemoveAt(_track);
+            _song.tracks.Insert(_track + 1, current);
+            _track++;
+            Commit();
+        }
+
+        float rowH = 34.0f;
+        _trackView.wheelScrollSpeed = Ui.WheelSpeed();
+        r.BeginScrollView(ref _trackView, rowH * (float)_song.tracks.Count());
+        Rect content = _trackView.content;
+        Ui.LimitHits(content);
+        for (int i = 0; i < _song.tracks.Count(); i++)
+        {
+            Track t = _song.tracks[i];
+            float top = _trackView.topY - rowH * (float)i;
+            Rect row = Rect(content.min.x, top - rowH + 2.0f, content.max.x, top);
+            if (row.max.y < content.min.y || row.min.y > content.max.y) { continue; }
+            bool hot = Ui.Free() && row.Contains(Ui.mouse);
+            row.Draw(i == _track ? Ui.Panel2 : (hot ? Ui.Field : Ui.Panel), true);
+            Color color = Ui.TrackColor(i);
+            row.CutLeft(4.0f).Draw(t.mute ? Ui.Alpha(color, 0.3f) : color, true);
+            row.CutRight(Ui.Pad);
+            Rect solo = row.CutRight(20.0f).Grow(-6.0f, 0.0f, -6.0f, 0.0f);
+            row.CutRight(Ui.Pad);
+            Rect mute = row.CutRight(20.0f).Grow(-6.0f, 0.0f, -6.0f, 0.0f);
+            t.solo = Ui.Toggle(solo, "S", t.solo, "Solo: hear only soloed tracks.");
+            t.mute = Ui.Toggle(mute, "M", t.mute, "Mute.");
+            row.Grow(-3.0f, -4.0f, -3.0f, -8.0f);
+            Ui.Label(row.CutTop(row.height * 0.55f), t.name, t.mute ? Ui.Dim : Ui.Text, 4.4f);
+            Ui.Label(row, TrackInfo(i), Ui.Dim, 3.8f);
+            if (hot && Ui.pressed && !solo.Contains(Ui.mouse) && !mute.Contains(Ui.mouse) && i != _track)
+            {
+                _track = i;
+                _roll.ClearSelection();
+                _roll.ShowTrackNotes();
+                _trackField.isSelected = false;
+            }
+        }
+        Ui.EndLimitHits();
+        _trackView.EndScrollView();
+    }
+
+    string TrackInfo(int index)
+    {
+        if (_trackInfoSerial != _editSerial || _trackInfo.Count() != _song.tracks.Count())
+        {
+            _trackInfoSerial = _editSerial;
+            _trackInfo.Clear();
+            for (int i = 0; i < _song.tracks.Count(); i++)
+            {
+                Track t = _song.tracks[i];
+                _trackInfo.Add((t.instrument.def != null ? t.instrument.def.label : t.instrument.kind) + $"  {t.notes.Count()} notes");
+            }
+        }
+        return _trackInfo[index];
+    }
+
+    void Inspector(Rect r)
+    {
+        Ui.Box(r, Ui.Panel, Ui.Line);
+        r.Grow(-Ui.Pad);
+        Rect tabs = r.CutTop(20.0f);
+        r.CutTop(Ui.Pad);
+        if (Ui.Button(tabs.CutLeft(tabs.width * 0.5f - 1.0f), "Track", _tab == Tab.Track)) { _tab = Tab.Track; }
+        tabs.CutLeft(2.0f);
+        if (Ui.Button(tabs, "Master", _tab == Tab.Master)) { _tab = Tab.Master; }
+
+        Track t = Current();
+        if (_tab == Tab.Track && t != null)
+        {
+            if (!_trackField.isSelected) { _trackField.currentValue = t.name; }
+            bool renamed = Ui.EditableLabel(r.CutTop(22.0f), ref _trackField, "Track name. Click to rename.");
+            r.CutTop(Ui.Pad);
+            if (_trackField.currentValue.Trim() != "") { t.name = _trackField.currentValue; }
+            if (renamed) { Commit(); }
+        }
+
+        _inspectorView.wheelScrollSpeed = Ui.WheelSpeed();
+        r.BeginScrollView(ref _inspectorView, _inspectorHeight);
+        Rect view = _inspectorView.content;
+        Ui.LimitHits(view);
+        float top = _inspectorView.topY;
+        float y = top;
+        if (_tab == Tab.Master) { y = MasterInspector(view, y); }
+        else if (t != null) { y = TrackInspector(view, y, t); }
+        Ui.EndLimitHits();
+        _inspectorView.EndScrollView();
+        _inspectorHeight = top - y;
+    }
+
+    const float RowHeight = 21.0f;
+
+    static Rect Row(Rect view, ref float y, float h)
+    {
+        Rect row = Rect(view.min.x, y - h, view.max.x, y);
+        y -= h + 3.0f;
+        return row;
+    }
+
+    static float Section(Rect view, float y, string title)
+    {
+        y -= 6.0f;
+        Rect row = Row(view, ref y, 18.0f);
+        Ui.Label(row, title, Ui.Accent, 4.4f);
+        row.CutBottom(1.0f).Draw(Ui.Line, true);
+        return y;
+    }
+
+    float ModuleParams(Rect view, float y, Module m, int block, int track, int module)
+    {
+        if (m.def == null) { return y; }
+        for (int i = 0; i < m.def.parameters.Count(); i++)
+        {
+            ParamDef p = m.def.parameters[i];
+            Rect row = Row(view, ref y, RowHeight);
+            if (row.max.y < view.min.y || row.min.y > view.max.y) { continue; }
+            double v = m.Get(p.key);
+            double changed = Ui.Param(row, WidgetId.Param(block, track, module, i), p, v);
+            if (changed != v) { m.Set(p.key, changed); }
+        }
+        return y;
+    }
+
+    float TrackInspector(Rect view, float y, Track t)
+    {
+        y = Section(view, y, "INSTRUMENT");
+        List<ModuleDef> instruments = Catalog.Instruments();
+        ModuleDef def = t.instrument.def;
+        int current = instruments.IndexOf(def);
+        int chosen = Ui.Dropdown(Row(view, ref y, RowHeight), WidgetId.Param(WidgetId.InstrumentBlock, _track, 0, WidgetId.MenuSlot), Catalog.InstrumentLabels(), current, def != null ? def.help : "");
+        if (chosen != current)
+        {
+            Module next = new Module(instruments[chosen].kind);
+            foreach (string key in t.instrument.values.Keys())
+            {
+                if (next.def.Find(key) != null) { next.Set(key, t.instrument.values.Get(key)); }
+            }
+            t.instrument = next;
+        }
+        y = ModuleParams(view, y, t.instrument, WidgetId.InstrumentBlock, _track, 0);
+
+        y = Section(view, y, "TRACK");
+        double db = t.gain > 1e-6 ? 20.0 * Math.Log10(t.gain) : -60.0;
+        double newDb = Ui.Param(Row(view, ref y, RowHeight), WidgetId.Param(WidgetId.MixerBlock, _track, 0, 0), GainParam, db, "Track volume; notes also scale by their velocity.");
+        if (newDb != db) { t.gain = newDb <= -59.99 ? 0.0 : Math.Pow(10.0, newDb / 20.0); }
+        t.tail = Ui.Param(Row(view, ref y, RowHeight), WidgetId.Param(WidgetId.MixerBlock, _track, 0, 1), TailParam, t.tail, "Seconds each note sounds past its end, for releases and ringing.");
+
+        return EffectChain(view, y, t.effects, "TRACK EFFECTS", WidgetId.TrackEffectBlock, _track);
+    }
+
+    float MasterInspector(Rect view, float y)
+    {
+        y = EffectChain(view, y, _song.master, "MASTER EFFECTS", WidgetId.MasterEffectBlock, 0);
+        y = Section(view, y, "FINISH");
+        Ui.Tip(Rect(view.min.x, y - 2.0f, view.max.x, y + 22.0f), "Fold wraps the tail onto the loop start. Level None leaves the mix as is; RMS scales it to the RMS target; Level scales to the quietest of the RMS target, LUFS ceiling and peak, then soft-limits. Saturate above applies tanh when the peak passes it (0 is off).");
+        y = ModuleParams(view, y, _song.finish, WidgetId.FinishBlock, 0, 0);
+        y = Section(view, y, "SONG");
+        Ui.Label(Row(view, ref y, 18.0f), $"{_song.tracks.Count()} tracks, loop {_song.LoopSeconds():F1} s + tail {_song.tail:F1} s", Ui.Dim, 4.0f);
+        return y;
+    }
+
+    float EffectChain(Rect view, float y, List<Module> chain, string title, int block, int track)
+    {
+        y = Section(view, y, title);
+        int remove = -1;
+        int moveUp = -1;
+        for (int i = 0; i < chain.Count(); i++)
+        {
+            Module fx = chain[i];
+            Rect head = Row(view, ref y, 19.0f);
+            head.Draw(Ui.Panel2, true);
+            if (Ui.SmallButton(head.CutRight(20.0f), "x", "Remove.")) { remove = i; }
+            if (Ui.SmallButton(head.CutRight(20.0f), "^", "Move earlier in the chain.") && i > 0) { moveUp = i; }
+            if (fx.def != null) { Ui.Tip(head, fx.def.help); }
+            head.CutLeft(6.0f);
+            Ui.Label(head, fx.def != null ? fx.def.label : fx.kind, Ui.Text, 4.3f);
+            y = ModuleParams(view, y, fx, block, track, i);
+        }
+        if (remove >= 0)
+        {
+            chain.RemoveAt(remove);
+            Commit();
+        }
+        if (moveUp > 0)
+        {
+            chain.Insert(moveUp - 1, chain.RemoveAt(moveUp));
+            Commit();
+        }
+        int added = Ui.Menu(Row(view, ref y, RowHeight), WidgetId.Param(block, track, WidgetId.MenuSlot, WidgetId.MenuSlot), "+ Effect", Catalog.EffectLabels(), "Add an effect at the end of the chain.");
+        if (added >= 0)
+        {
+            chain.Add(new Module(Catalog.Effects()[added].kind));
+            Commit();
+        }
+        return y;
+    }
+
+    void Waveform(Rect r)
+    {
+        Ui.Box(r, Ui.Panel, Ui.Line);
+        r.Grow(-Ui.Pad);
+        if (_baked == null)
+        {
+            Ui.Label(r, "Baking...", Ui.Dim, 4.2f, HorizontalAlignment.Center);
+            return;
+        }
+        int columns = Mathf.Clamp((int)(r.width * Screen.GetSize().y / Screen.GetUISize().y * 0.5f), 100, 800);
+        if (_waveMin == null || _waveMin.Length != columns) { MakeWave(_baked, columns); }
+        float mid = r.center.y;
+        float half = r.height * 0.5f;
+        float columnW = r.width / (float)_waveMin.Length;
+        for (int c = 0; c < _waveMin.Length; c++)
+        {
+            float x = r.min.x + columnW * (float)c;
+            float lo = mid + Mathf.Max(-1.0f, _waveMin[c]) * half;
+            float hi = Mathf.Max(lo + 1.0f, mid + Mathf.Min(1.0f, _waveMax[c]) * half);
+            Rect(x, lo, x + columnW, hi).Draw(Ui.AccentDim, true);
+        }
+        float headX = r.min.x + r.width * (float)Math.Min(1.0, head * _bakedBeat / _bakedSeconds);
+        Rect(headX - 1.0f, r.min.y, headX + 1.0f, r.max.y).Draw(Ui.Accent, true);
+        if (Ui.Free() && r.Contains(Ui.mouse) && Ui.pressed) { Seek((double)((Ui.mouse.x - r.min.x) / r.width) * _bakedSeconds / _bakedBeat); }
+        Ui.Tip(r, "The last bake. Click to move the playhead.");
+    }
+}

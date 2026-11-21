@@ -1,0 +1,103 @@
+using NioEngine;
+
+public static class Presets
+{
+    // Other files can register songs before this class's static initialization.
+    static List<string> _names;
+    static List<func<Song()>> _makers;
+
+    static List<string> _savedNames;
+    static List<string> _savedTexts;
+
+    public static void Add(string name, func<Song()> make)
+    {
+        if (_names == null)
+        {
+            _names = new List<string>();
+            _makers = new List<func<Song()>>();
+        }
+        _names.Add(name);
+        _makers.Add(make);
+    }
+
+    public static int Count()
+    {
+        Load();
+        return _savedNames.Count() + (_names == null ? 0 : _names.Count());
+    }
+
+    public static string Name(int index)
+    {
+        Load();
+        int saved = _savedNames.Count();
+        return index < saved ? _savedNames[index] : _names[index - saved];
+    }
+
+    public static Song Make(int index)
+    {
+        Load();
+        int saved = _savedNames.Count();
+        return index < saved ? SongFile.Read(_savedTexts[index]) : _makers[index - saved]();
+    }
+
+    public static Song First() { return Count() > 0 ? Make(0) : NewSong(); }
+
+    public static Song NewSong()
+    {
+        Song s = new Song();
+        s.bars = 4;
+        s.tail = 4.0;
+        s.master.Add(new Module("hall").Set("size", 2.0).Set("wet", 0.25));
+        Track pad = s.AddTrack("Pad", "pad");
+        pad.gain = 0.08;
+        pad.tail = 1.5;
+        Track lead = s.AddTrack("Lead", "flute");
+        lead.gain = 0.15;
+        lead.tail = 0.3;
+        lead.Fx(new Module("delay").Set("beats", 0.75).Set("feedback", 0.3));
+        return s;
+    }
+
+    public static bool CanSave()
+    {
+#if NIO_EDITOR
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    public static bool Save(Song song)
+    {
+#if NIO_EDITOR
+        Load();
+        string file = SongFile.FileName(song.name);
+        int at = _savedNames.FindIndex(name => SongFile.FileName(name) == file);
+        if (at < 0)
+        {
+            _savedNames.Add(song.name);
+            _savedTexts.Add(SongFile.Write(song));
+        }
+        else
+        {
+            _savedNames[at] = song.name;
+            _savedTexts[at] = SongFile.Write(song);
+        }
+        return PresetWriter.Write(_savedNames, _savedTexts);
+#else
+        return false;
+#endif
+    }
+
+    static void Load()
+    {
+        if (_savedNames != null) { return; }
+        _savedNames = new List<string>();
+        _savedTexts = new List<string>();
+        for (int i = 0; i < PresetData.Count(); i++)
+        {
+            _savedNames.Add(PresetData.Name(i));
+            _savedTexts.Add(PresetData.Text(i));
+        }
+    }
+}

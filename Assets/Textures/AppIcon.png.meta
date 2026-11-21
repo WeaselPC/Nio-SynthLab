@@ -1,0 +1,14 @@
+assetVersion: 1.0
+assetType: Texture
+guid: 4291844628447714159
+Parameters:
+  Filtering: 1
+  GenerateMips: true
+  IsMultiple: false
+  NumTiles: 1
+  TileSize: [1, 1]
+  Border: [0, 0, 0, 0]
+  PixelsPerUnit: 1
+  AllowRuntimeCPUData: false
+SliceMode: 0
+SpritesBin: AAAAAAA=

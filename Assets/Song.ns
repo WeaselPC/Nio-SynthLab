@@ -1,0 +1,531 @@
+using NioEngine;
+
+public enum ParamKind { Linear, Log, Int, Toggle, Choice }
+
+public class ParamDef
+{
+    public string key;
+    public string label;
+    public ParamKind kind;
+    public double min;
+    public double max;
+    public double def;
+    public string[] options;
+
+    public ParamDef(string key, string label, ParamKind kind, double min, double max, double def)
+    {
+        this.key = key;
+        this.label = label;
+        this.kind = kind;
+        this.min = min;
+        this.max = max;
+        this.def = def;
+    }
+
+    public double Clamp(double v)
+    {
+        v = Math.Clamp(v, min, max);
+        return kind == ParamKind.Linear || kind == ParamKind.Log ? v : Math.Round(v);
+    }
+
+    public double ToUnit(double v)
+    {
+        if (kind == ParamKind.Log)
+        {
+            double lo = Math.Max(min, 1e-6);
+            return Math.Log(Math.Max(v, lo) / lo) / Math.Log(max / lo);
+        }
+        return (v - min) / (max - min);
+    }
+
+    public double FromUnit(double u)
+    {
+        u = Math.Clamp(u, 0.0, 1.0);
+        if (kind == ParamKind.Log)
+        {
+            double lo = Math.Max(min, 1e-6);
+            return lo * Math.Pow(max / lo, u);
+        }
+        return min + (max - min) * u;
+    }
+
+    public string Format(double v)
+    {
+        if (kind == ParamKind.Toggle) { return v >= 0.5 ? "on" : "off"; }
+        if (kind == ParamKind.Choice)
+        {
+            int i = (int)Math.Round(v);
+            return i >= 0 && i < options.Length ? options[i] : "?";
+        }
+        if (kind == ParamKind.Int) { return $"{(int)Math.Round(v)}"; }
+        double a = Math.Abs(v);
+        if (a >= 1000.0) { return $"{v:F0}"; }
+        if (a >= 100.0) { return $"{v:F1}"; }
+        if (a >= 1.0) { return $"{v:F2}"; }
+        return $"{v:F3}";
+    }
+}
+
+public class ModuleDef
+{
+    public string kind;
+    public string label;
+    public string help;
+    public List<ParamDef> parameters = new List<ParamDef>();
+
+    func<Signal(Module, double, double)> _note;
+    func<Signal(Module, float[], double)> _line;
+    func<Signal(Signal, Module, Song)> _effect;
+
+    public ModuleDef(string kind, string label, string help)
+    {
+        this.kind = kind;
+        this.label = label;
+        this.help = help;
+    }
+
+    public bool isInstrument => _note != null || _line != null;
+    public bool isEffect => _effect != null;
+    public bool legato => _line != null;
+
+    public Signal Play(Module m, double pitch, double seconds)
+    {
+        func<Signal(Module, double, double)> render = _note;
+        return render(m, pitch, seconds);
+    }
+
+    // Points are (seconds, MIDI pitch) pairs.
+    public Signal Sing(Module m, float[] points, double seconds)
+    {
+        func<Signal(Module, float[], double)> render = _line;
+        return render(m, points, seconds);
+    }
+
+    public void Apply(Signal s, Module m, Song song)
+    {
+        func<Signal(Signal, Module, Song)> apply = _effect;
+        apply(s, m, song);
+    }
+
+    public ModuleDef Lin(string key, string label, double min, double max, double def)
+    {
+        parameters.Add(new ParamDef(key, label, ParamKind.Linear, min, max, def));
+        return this;
+    }
+
+    public ModuleDef Log(string key, string label, double min, double max, double def)
+    {
+        parameters.Add(new ParamDef(key, label, ParamKind.Log, min, max, def));
+        return this;
+    }
+
+    public ModuleDef Int(string key, string label, double min, double max, double def)
+    {
+        parameters.Add(new ParamDef(key, label, ParamKind.Int, min, max, def));
+        return this;
+    }
+
+    public ModuleDef Toggle(string key, string label, bool def)
+    {
+        parameters.Add(new ParamDef(key, label, ParamKind.Toggle, 0.0, 1.0, def ? 1.0 : 0.0));
+        return this;
+    }
+
+    public ModuleDef Choice(string key, string label, string[] options, int def)
+    {
+        ParamDef p = new ParamDef(key, label, ParamKind.Choice, 0.0, (double)(options.Length - 1), (double)def);
+        p.options = options;
+        parameters.Add(p);
+        return this;
+    }
+
+    public ModuleDef Plays(func<Signal(Module, double, double)> render)
+    {
+        _note = render;
+        return this;
+    }
+
+    public ModuleDef Sings(func<Signal(Module, float[], double)> render)
+    {
+        _line = render;
+        return this;
+    }
+
+    public ModuleDef Applies(func<Signal(Signal, Module, Song)> apply)
+    {
+        _effect = apply;
+        return this;
+    }
+
+    public ParamDef Find(string key)
+    {
+        for (int i = 0; i < parameters.Count(); i++)
+        {
+            if (parameters[i].key == key) { return parameters[i]; }
+        }
+        return null;
+    }
+}
+
+public class Module
+{
+    public string kind;
+    public ModuleDef def;
+    public Map<string, double> values = new Map<string, double>();
+
+    public Module(string kind)
+    {
+        this.kind = kind;
+        def = Catalog.Find(kind);
+    }
+
+    public double Get(string key)
+    {
+        double v = 0.0;
+        if (values.TryGetValue(key, out v)) { return v; }
+        ParamDef p = def != null ? def.Find(key) : null;
+        return p != null ? p.def : 0.0;
+    }
+
+    public Module Set(string key, double v)
+    {
+        values.Set(key, v);
+        return this;
+    }
+
+    public Module Copy()
+    {
+        Module m = new Module(kind);
+        foreach (string key in values.Keys()) { m.values.Set(key, values.Get(key)); }
+        return m;
+    }
+}
+
+public class Note
+{
+    // Start and length are in beats. Pitch is a MIDI note number.
+    public double start;
+    public double length;
+    public double pitch;
+    public double velocity;
+
+    public Note(double start, double length, double pitch, double velocity)
+    {
+        this.start = start;
+        this.length = length;
+        this.pitch = pitch;
+        this.velocity = velocity;
+    }
+
+    public double End() { return start + length; }
+    public Note Copy() { return new Note(start, length, pitch, velocity); }
+}
+
+public class Track
+{
+    public string name;
+    public Module instrument;
+    public List<Module> effects = new List<Module>();
+    public List<Note> notes = new List<Note>();
+    public double gain = 1.0;
+    // Release time per note, in seconds.
+    public double tail = 0.5;
+    public bool mute;
+    public bool solo;
+
+    public Track(string name, string instrument)
+    {
+        this.name = name;
+        this.instrument = new Module(instrument);
+    }
+
+    public Track Fx(Module effect)
+    {
+        effects.Add(effect);
+        return this;
+    }
+
+    public Track Add(double start, double length, double pitch, double velocity)
+    {
+        notes.Add(new Note(start, length, pitch, velocity));
+        return this;
+    }
+
+    public Track Copy()
+    {
+        Track t = new Track(name, instrument.kind);
+        t.instrument = instrument.Copy();
+        for (int i = 0; i < effects.Count(); i++) { t.effects.Add(effects[i].Copy()); }
+        for (int i = 0; i < notes.Count(); i++) { t.notes.Add(notes[i].Copy()); }
+        t.gain = gain;
+        t.tail = tail;
+        t.mute = mute;
+        t.solo = solo;
+        return t;
+    }
+}
+
+public class Song
+{
+    public string name = "Untitled";
+    public double bpm = 90.0;
+    public int beatsPerBar = 4;
+    public int bars = 8;
+    // Seconds of effect and release tails beyond the loop.
+    public double tail = 6.0;
+    public long seed = 1;
+    public List<Track> tracks = new List<Track>();
+    public List<Module> master = new List<Module>();
+    public Module finish;
+
+    // A field initializer can run before Catalog loads.
+    public Song()
+    {
+        finish = new Module("finish");
+    }
+
+    public double Beat() { return 60.0 / bpm; }
+    public double LoopBeats() { return (double)(bars * beatsPerBar); }
+    public double LoopSeconds() { return LoopBeats() * Beat(); }
+
+    public Track AddTrack(string name, string instrument)
+    {
+        Track t = new Track(name, instrument);
+        tracks.Add(t);
+        return t;
+    }
+
+    public Song Copy()
+    {
+        Song s = new Song();
+        s.name = name;
+        s.bpm = bpm;
+        s.beatsPerBar = beatsPerBar;
+        s.bars = bars;
+        s.tail = tail;
+        s.seed = seed;
+        for (int i = 0; i < tracks.Count(); i++) { s.tracks.Add(tracks[i].Copy()); }
+        for (int i = 0; i < master.Count(); i++) { s.master.Add(master[i].Copy()); }
+        s.finish = finish.Copy();
+        return s;
+    }
+}
+
+public static class SongFile
+{
+    public const string Extension = ".synth";
+
+    public static string FileName(string name)
+    {
+        byte[] b = UTF8.GetBytes(name);
+        for (int i = 0; i < b.Length; i++)
+        {
+            int c = (int)b[i];
+            bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ' ';
+            if (!safe) { b[i] = (byte)'_'; }
+        }
+        string file = UTF8.GetString(b).Trim();
+        return (file == "" ? "Untitled" : file) + Extension;
+    }
+
+    public static string Number(double v)
+    {
+        if (Math.Abs(v - Math.Round(v)) < 1e-9) { return $"{(long)Math.Round(v)}"; }
+        return $"{v:0.######}";
+    }
+
+    public static string Write(Song song)
+    {
+        string o = "synthlab 1\n";
+        o += $"song name={Quote(song.name)} bpm={Number(song.bpm)} beatsPerBar={song.beatsPerBar} bars={song.bars} tail={Number(song.tail)} seed={song.seed}\n";
+        o += Values(song.finish) + "\n";
+        for (int i = 0; i < song.master.Count(); i++) { o += "master " + Values(song.master[i]) + "\n"; }
+        for (int i = 0; i < song.tracks.Count(); i++)
+        {
+            Track t = song.tracks[i];
+            o += $"track name={Quote(t.name)} gain={Number(t.gain)} tail={Number(t.tail)} mute={(t.mute ? 1 : 0)} solo={(t.solo ? 1 : 0)}\n";
+            o += Sound(t);
+        }
+        return o;
+    }
+
+    public static string Sound(Track t)
+    {
+        string o = "inst " + Values(t.instrument) + "\n";
+        for (int i = 0; i < t.effects.Count(); i++) { o += "fx " + Values(t.effects[i]) + "\n"; }
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            Note n = t.notes[i];
+            o += $"note {Number(n.start)} {Number(n.length)} {Number(n.pitch)} {Number(n.velocity)}\n";
+        }
+        return o;
+    }
+
+    public static Song Read(string text)
+    {
+        if (text == null) { return null; }
+        byte[] bytes = UTF8.GetBytes(text);
+        List<string> t = new List<string>();
+        Song song = null;
+        Track track = null;
+        int at = 0;
+        while (at < bytes.Length)
+        {
+            at = Tokens(text, bytes, at, t);
+            if (t.Count() == 0) { continue; }
+            string head = t[0];
+            if (song == null)
+            {
+                if (head != "synthlab") { return null; }
+                song = new Song();
+            }
+            else if (head == "song")
+            {
+                Map<string, string> v = Pairs(t);
+                song.name = v.GetValueOrDefault("name", song.name);
+                song.bpm = Math.Max(10.0, Parse(v.GetValueOrDefault("bpm", ""), song.bpm));
+                song.beatsPerBar = Math.Max(1, (int)Parse(v.GetValueOrDefault("beatsPerBar", ""), (double)song.beatsPerBar));
+                song.bars = Math.Max(1, (int)Parse(v.GetValueOrDefault("bars", ""), (double)song.bars));
+                song.tail = Parse(v.GetValueOrDefault("tail", ""), song.tail);
+                song.seed = (long)Parse(v.GetValueOrDefault("seed", ""), (double)song.seed);
+            }
+            else if (head == "finish")
+            {
+                Module m = ReadModule(t, 0);
+                if (m != null) { song.finish = m; }
+            }
+            else if (head == "master")
+            {
+                Module m = ReadModule(t, 1);
+                if (m != null && m.def.isEffect) { song.master.Add(m); }
+            }
+            else if (head == "track")
+            {
+                Map<string, string> v = Pairs(t);
+                track = song.AddTrack(v.GetValueOrDefault("name", "Track"), "pad");
+                track.gain = Parse(v.GetValueOrDefault("gain", ""), 1.0);
+                track.tail = Parse(v.GetValueOrDefault("tail", ""), 0.5);
+                track.mute = Parse(v.GetValueOrDefault("mute", ""), 0.0) > 0.5;
+                track.solo = Parse(v.GetValueOrDefault("solo", ""), 0.0) > 0.5;
+            }
+            else if (track == null) { continue; }
+            else if (head == "inst")
+            {
+                Module m = ReadModule(t, 1);
+                if (m != null && m.def.isInstrument) { track.instrument = m; }
+            }
+            else if (head == "fx")
+            {
+                Module m = ReadModule(t, 1);
+                if (m != null && m.def.isEffect) { track.effects.Add(m); }
+            }
+            else if (head == "note" && t.Count() >= 4)
+            {
+                double velocity = t.Count() >= 5 ? Parse(t[4], 1.0) : 1.0;
+                track.notes.Add(new Note(Parse(t[1], 0.0), Parse(t[2], 1.0), Parse(t[3], 60.0), velocity));
+            }
+        }
+        return song;
+    }
+
+    static string Quote(string s)
+    {
+        if (!s.Contains("\"") && !s.Contains("\n")) { return "\"" + s + "\""; }
+        string o = "\"";
+        for (int i = 0; i < s.Length(); i++)
+        {
+            string c = s.CharAt(i);
+            o += c == "\"" || c == "\n" ? "'" : c;
+        }
+        return o + "\"";
+    }
+
+    static string Values(Module m)
+    {
+        string o = m.kind;
+        if (m.def == null) { return o; }
+        for (int i = 0; i < m.def.parameters.Count(); i++)
+        {
+            ParamDef p = m.def.parameters[i];
+            o += " " + p.key + "=" + Number(m.Get(p.key));
+        }
+        return o;
+    }
+
+    static bool IsSpace(byte c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+    static int Tokens(string text, byte[] b, int at, List<string> tokens)
+    {
+        tokens.Clear();
+        int i = at;
+        while (i < b.Length && b[i] != '\n')
+        {
+            if (IsSpace(b[i]))
+            {
+                i++;
+                continue;
+            }
+            int start = i;
+            int open = -1;
+            int close = -1;
+            while (i < b.Length && b[i] != '\n' && ((open >= 0 && close < 0) || !IsSpace(b[i])))
+            {
+                if (b[i] == '"')
+                {
+                    if (open < 0) { open = i; }
+                    else if (close < 0) { close = i; }
+                }
+                i++;
+            }
+            if (open < 0) { tokens.Add(text.Substring(start, i - start)); }
+            else
+            {
+                int end = close < 0 ? i : close;
+                tokens.Add(text.Substring(start, open - start) + text.Substring(open + 1, end - open - 1));
+            }
+        }
+        return i + 1;
+    }
+
+    static Map<string, string> Pairs(List<string> tokens)
+    {
+        Map<string, string> pairs = new Map<string, string>();
+        for (int i = 1; i < tokens.Count(); i++)
+        {
+            int eq = EqualsAt(tokens[i]);
+            if (eq > 0) { pairs.Set(tokens[i].Substring(0, eq), tokens[i].Substring(eq + 1)); }
+        }
+        return pairs;
+    }
+
+    static int EqualsAt(string token)
+    {
+        for (int i = 0; i < token.Length(); i++)
+        {
+            if (token.CharAt(i) == "=") { return i; }
+        }
+        return -1;
+    }
+
+    static double Parse(string s, double fallback)
+    {
+        double v = 0.0;
+        return double.TryParse(s, out v) ? v : fallback;
+    }
+
+    static Module ReadModule(List<string> tokens, int kindIndex)
+    {
+        if (kindIndex >= tokens.Count()) { return null; }
+        Module m = new Module(tokens[kindIndex]);
+        if (m.def == null) { return null; }
+        for (int i = kindIndex + 1; i < tokens.Count(); i++)
+        {
+            int eq = EqualsAt(tokens[i]);
+            if (eq <= 0) { continue; }
+            string key = tokens[i].Substring(0, eq);
+            ParamDef p = m.def.Find(key);
+            if (p != null) { m.Set(key, p.Clamp(Parse(tokens[i].Substring(eq + 1), p.def))); }
+        }
+        return m;
+    }
+}

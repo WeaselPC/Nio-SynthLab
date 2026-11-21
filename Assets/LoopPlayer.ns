@@ -1,0 +1,174 @@
+using NioEngine;
+
+public class LoopPlayer
+{
+    const double FadeSeconds = 0.25;
+
+    AudioComponent _voiceA;
+    AudioComponent _voiceB;
+
+    AudioComponent _voice;
+    MusicTransport _transport;
+    AudioFile _clip;
+    Signal _loop;
+    string _name = "";
+    double _beatSeconds = 1.0;
+
+    MusicTransport _outgoing;
+    AudioFile _outgoingClip;
+    ulong _fadeFrame;
+
+    double _volume = 0.8;
+    double _beats;
+
+    public LoopPlayer()
+    {
+        _voiceA = MakeVoice("Synth Lab music A");
+        _voiceB = MakeVoice("Synth Lab music B");
+        _voice = _voiceA;
+    }
+
+    static AudioComponent MakeVoice(string name)
+    {
+        Entity entity = Entity.Create(Vec2f.Zero);
+        entity.name = name;
+        return entity.AddComponent<AudioComponent>();
+    }
+
+    public bool Crossfading => _outgoing != null;
+
+    public double Beats => _beats;
+
+    public double Volume
+    {
+        get { return _volume; }
+        set
+        {
+            _volume = value;
+            if (_transport != null) { _transport.SetVolume(_volume); }
+        }
+    }
+
+    public bool Play(Signal loop, double beatSeconds, string name, double fromBeats)
+    {
+        EndFade();
+        AudioFile old = _clip;
+        _loop = loop;
+        _name = name;
+        _beatSeconds = beatSeconds;
+        _beats = fromBeats;
+        _clip = loop.ToAudio(true, name);
+        _voice.audio = _clip;
+        _transport = _voice.PrepareMusic();
+        if (old != null) { Synth.ReleaseAudio(old); }
+        if (_transport == null) { return false; }
+        _transport.SetVolume(_volume);
+        // Start resets to zero. Resume preserves the seek position.
+        double seconds = fromBeats * beatSeconds;
+        if (seconds > 0.01 && seconds < loop.Duration)
+        {
+            _transport.Seek(seconds);
+            _transport.ScheduleResume(AudioClock.ScheduleAfter(0.05));
+        }
+        else { _transport.Start(0.05); }
+        return true;
+    }
+
+    public bool Swap(Signal loop, double beatSeconds, string name)
+    {
+        EndFade();
+        MusicTransport old = _transport;
+        if (old == null || !old.IsValid || old.Snapshot.State != MusicState.Playing) { return Play(loop, beatSeconds, name, _beats); }
+        MusicPlaybackSnapshot snap = old.Snapshot;
+        ulong frame = AudioClock.ScheduleAfter(0.08);
+        if (frame == 0ul || frame <= snap.RenderFrame || snap.SampleRate == 0u) { return Play(loop, beatSeconds, name, _beats); }
+        AudioComponent next = _voice == _voiceA ? _voiceB : _voiceA;
+        AudioFile clip = loop.ToAudio(true, name);
+        next.audio = clip;
+        MusicTransport incoming = next.PrepareMusic();
+        if (incoming == null)
+        {
+            Synth.ReleaseAudio(clip);
+            return Play(loop, beatSeconds, name, _beats);
+        }
+        // Match beats at the scheduled frame, even across a tempo change.
+        double at = snap.SourcePositionSeconds + (double)(frame - snap.RenderFrame) / (double)snap.SampleRate * snap.Rate;
+        if (snap.DurationSeconds > 0.0) { at = at % snap.DurationSeconds; }
+        double length = loop.Duration;
+        double seconds = at / _beatSeconds * beatSeconds;
+        if (length > 0.0) { seconds = seconds % length; }
+        // Seek to the sample midpoint to avoid rounding into its neighbor.
+        double rate = (double)Synth.SampleRate;
+        seconds = Math.Min((Math.Round(seconds * rate) + 0.5) / rate, length - 1.0 / rate);
+        incoming.SetVolume(0.0);
+        incoming.Seek(seconds);
+        incoming.ScheduleResume(frame);
+
+        _outgoing = old;
+        _outgoingClip = _clip;
+        _fadeFrame = frame;
+        _transport = incoming;
+        _voice = next;
+        _clip = clip;
+        _loop = loop;
+        _name = name;
+        _beatSeconds = beatSeconds;
+        return true;
+    }
+
+    public bool Seek(double beats)
+    {
+        if (_transport == null) { return true; }
+        double seconds = beats * _beatSeconds;
+        if (_outgoing != null || seconds >= _loop.Duration) { return Play(_loop, _beatSeconds, _name, beats); }
+        _transport.Seek(seconds);
+        _beats = beats;
+        return true;
+    }
+
+    public void Stop()
+    {
+        EndFade();
+        if (_transport != null) { _transport.Stop(); }
+        _transport = null;
+    }
+
+    public void Update()
+    {
+        UpdateFade();
+        if (_transport == null || _loop.Duration <= 0.0) { return; }
+        double seconds = 0.0;
+        if (!_transport.TryGetPositionAt(AudioClock.Now(), out seconds)) { return; }
+        seconds = seconds % _loop.Duration;
+        if (seconds < 0.0) { seconds += _loop.Duration; }
+        _beats = seconds / _beatSeconds;
+    }
+
+    void UpdateFade()
+    {
+        if (_outgoing == null) { return; }
+        double progress = 0.0;
+        AudioClockSnapshot clock;
+        if (AudioClock.TryGetSnapshot(out clock) && clock.RenderFrame > _fadeFrame && clock.SampleRate > 0u)
+        {
+            progress = (double)(clock.RenderFrame - _fadeFrame) / ((double)clock.SampleRate * FadeSeconds);
+        }
+        if (progress >= 1.0)
+        {
+            EndFade();
+            return;
+        }
+        _outgoing.SetVolume(_volume * (1.0 - progress));
+        if (_transport != null) { _transport.SetVolume(_volume * progress); }
+    }
+
+    void EndFade()
+    {
+        if (_outgoing == null) { return; }
+        _outgoing.Dispose();
+        if (_outgoingClip != null) { Synth.ReleaseAudio(_outgoingClip); }
+        _outgoing = null;
+        _outgoingClip = null;
+        if (_transport != null) { _transport.SetVolume(_volume); }
+    }
+}

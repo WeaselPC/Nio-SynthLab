@@ -1,0 +1,249 @@
+using NioEngine;
+
+public static class Catalog
+{
+    static List<ModuleDef> s_instruments;
+    static List<ModuleDef> s_effects;
+    static ModuleDef s_finish;
+    static Map<string, ModuleDef> s_byKind;
+    static string[] s_instrumentLabels;
+    static string[] s_effectLabels;
+
+    public static List<ModuleDef> Instruments() { Init(); return s_instruments; }
+    public static List<ModuleDef> Effects() { Init(); return s_effects; }
+    public static string[] InstrumentLabels() { Init(); return s_instrumentLabels; }
+    public static string[] EffectLabels() { Init(); return s_effectLabels; }
+
+    public static ModuleDef Find(string kind) { Init(); return s_byKind.Get(kind); }
+
+    // Other files can request instruments during static initialization.
+    static void Init()
+    {
+        if (s_byKind != null) { return; }
+        s_byKind = new Map<string, ModuleDef>();
+        s_instruments = new List<ModuleDef>();
+        s_effects = new List<ModuleDef>();
+        AddTonal();
+        AddVoices();
+        AddPercussionAndTexture();
+        AddEffects();
+
+        s_finish = new ModuleDef("finish", "Finish", "What happens to the mix before it plays.")
+            .Toggle("fold", "Fold tail into loop", true).Toggle("dc", "Remove DC", true).Toggle("even", "Even out", false)
+            .Choice("mode", "Level", ["None", "RMS", "Level"], 1).Lin("rms", "RMS target", 0.01, 0.5, 0.135)
+            .Lin("peak", "Peak ceiling", 0.05, 1.0, 0.5).Lin("lufs", "LUFS ceiling", -40.0, 0.0, 0.0).Lin("tanh", "Saturate above", 0.0, 1.0, 0.9);
+        s_byKind.Set(s_finish.kind, s_finish);
+
+        s_instrumentLabels = Labels(s_instruments);
+        s_effectLabels = Labels(s_effects);
+    }
+
+    static string[] Labels(List<ModuleDef> defs)
+    {
+        string[] labels = new string[defs.Count()];
+        for (int i = 0; i < defs.Count(); i++) { labels[i] = defs[i].label; }
+        return labels;
+    }
+
+    static ModuleDef Instrument(string kind, string label, string help)
+    {
+        ModuleDef def = new ModuleDef(kind, label, help);
+        s_instruments.Add(def);
+        s_byKind.Set(kind, def);
+        return def;
+    }
+
+    static ModuleDef Effect(string kind, string label, string help)
+    {
+        ModuleDef def = new ModuleDef(kind, label, help);
+        s_effects.Add(def);
+        s_byKind.Set(kind, def);
+        return def;
+    }
+
+    static void AddTonal()
+    {
+        Instrument("tone", "Tone", "Struck partials with an exponential decay: bells, glass, bass plucks.")
+            .Choice("partials", "Partials", ["Harmonic", "Bell", "Glass"], 0).Lin("h2", "2nd harmonic", 0.0, 1.0, 0.3).Lin("h3", "3rd harmonic", 0.0, 1.0, 0.08)
+            .Log("decay", "Decay", 0.05, 40.0, 1.0).Log("attack", "Attack", 0.0005, 1.0, 0.004)
+            .Plays(Catalog.Tone);
+        Instrument("pad", "Pad", "Soft pad: fundamental, sharp octave and sub-octave, breathing slowly.")
+            .Log("attack", "Attack", 0.01, 8.0, 1.6).Log("release", "Release", 0.01, 8.0, 1.8).Lin("bright", "Brightness", 0.0, 1.0, 0.35)
+            .Plays((m, pitch, dur) => Synth.Pad(Synth.Note(pitch), dur, m.Get("attack"), m.Get("release"), m.Get("bright")));
+        Instrument("glasspad", "Glass pad", "Glass harmonica: a twin a fraction of a hertz off beats slowly.")
+            .Log("attack", "Attack", 0.01, 8.0, 1.2).Log("release", "Release", 0.01, 8.0, 2.0).Lin("bright", "Octave", 0.0, 1.0, 0.22)
+            .Lin("beatMin", "Beat min (Hz)", 0.0, 3.0, 0.5).Lin("beatMax", "Beat max (Hz)", 0.0, 3.0, 0.5)
+            .Plays((m, pitch, dur) => Synth.GlassPad(Synth.Note(pitch), dur, m.Get("attack"), m.Get("release"), m.Get("bright"),
+                Synth.Range(m.Get("beatMin"), m.Get("beatMax") + 1e-9)));
+        Instrument("flute", "Flute", "Soft lead with vibrato that grows in and a little breath.")
+            .Lin("vibrato", "Vibrato", 0.0, 0.03, 0.004)
+            .Plays((m, pitch, dur) => Synth.Flute(Synth.Note(pitch), dur, m.Get("vibrato")));
+        Instrument("saw", "Saw drone", "Additive saw with an envelope and a low-pass, for drones.")
+            .Int("harmonics", "Harmonics", 1.0, 40.0, 12.0).Log("attack", "Attack", 0.001, 8.0, 2.0).Log("release", "Release", 0.001, 8.0, 2.5)
+            .Log("cutoff", "Cutoff", 40.0, 16000.0, 380.0)
+            .Plays((m, pitch, dur) => Synth.Saw(Synth.Note(pitch), dur, (int)m.Get("harmonics")).EnvAR(m.Get("attack"), m.Get("release")).Lowpass(m.Get("cutoff")));
+        Instrument("brass", "Brass", "Brass swell whose upper harmonics open with the envelope; several players make a section.")
+            .Log("attack", "Attack", 0.01, 4.0, 0.2).Log("release", "Release", 0.01, 4.0, 0.7).Lin("bright", "Brightness", 0.2, 3.0, 1.0)
+            .Int("players", "Players", 1.0, 8.0, 1.0).Lin("spread", "Spread (cents)", 0.0, 30.0, 8.0)
+            .Plays(Catalog.Brass);
+        Instrument("strings", "Strings", "Three detuned saws per note with vibrato, darkened.")
+            .Log("attack", "Attack", 0.01, 6.0, 1.0).Log("release", "Release", 0.01, 6.0, 1.2).Log("cutoff", "Cutoff", 200.0, 12000.0, 2200.0)
+            .Lin("tremolo", "Tremolo", 0.0, 1.0, 0.0).Lin("tremoloRate", "Tremolo rate", 0.5, 16.0, 6.0).Lin("crescendo", "Crescendo", 0.0, 3.0, 0.0)
+            .Plays((m, pitch, dur) => Synth.Strings([(int)Math.Round(pitch)], dur, m.Get("attack"), m.Get("release"), m.Get("cutoff"),
+                m.Get("tremolo"), m.Get("tremoloRate"), m.Get("crescendo")).Gain(3.0));
+        Instrument("kalimba", "Kalimba", "Plucked tine with its inharmonic mode and a click.")
+            .Plays((m, pitch, dur) => Synth.Kalimba(Synth.Note(pitch), dur));
+        Instrument("square", "Square blip", "Raw square wave: signal blips and chiptune leads.")
+            .Log("attack", "Attack", 0.0005, 2.0, 0.004).Log("release", "Release", 0.001, 2.0, 0.02).Log("cutoff", "Cutoff", 100.0, 16000.0, 3200.0)
+            .Plays(Catalog.Square);
+        Instrument("ping", "Sonar ping", "Sine whose pitch sinks slowly, with an exponential decay.")
+            .Lin("drop", "Pitch drop /s", 0.0, 0.2, 0.01).Log("decay", "Decay", 0.05, 30.0, 2.2).Log("attack", "Attack", 0.0005, 0.5, 0.002)
+            .Plays(Catalog.Ping);
+    }
+
+    static void AddVoices()
+    {
+        Instrument("choir", "Choir", "A few voices on one line, shaped by a vowel. Touching notes glide.")
+            .Choice("vowel", "Vowel", ["Ah", "AhHigh", "Oo"], 0).Int("chorus", "Singers", 1.0, 8.0, 3.0).Lin("spread", "Spread (cents)", 0.0, 40.0, 9.0)
+            .Lin("vibrato", "Vibrato", 0.0, 0.03, 0.0055).Log("attack", "Attack", 0.01, 8.0, 1.4).Log("release", "Release", 0.01, 8.0, 2.0)
+            .Log("glide", "Glide", 0.01, 4.0, 0.35).Log("cutoff", "Harmonics to", 500.0, 12000.0, 4200.0).Lin("low", "Chest", 0.0, 1.0, 0.12)
+            .Sings((m, points, dur) => Synth.Sung(points, dur, Vowel(m), (int)m.Get("chorus"), m.Get("spread"), m.Get("vibrato"),
+                m.Get("attack"), m.Get("release"), m.Get("glide"), m.Get("cutoff"), m.Get("low")));
+        Instrument("call", "Reef call", "Whale-like voice on a hollow oo; touching notes glide slowly.")
+            .Log("attack", "Attack", 0.01, 8.0, 2.0).Log("release", "Release", 0.01, 8.0, 3.0)
+            .Sings((m, points, dur) => Synth.Call(points, dur, m.Get("attack"), m.Get("release")));
+    }
+
+    static void AddPercussionAndTexture()
+    {
+        Instrument("boom", "Boom", "Deep hit: a falling sine and a thump of low noise.").Log("decay", "Decay", 0.1, 20.0, 1.6)
+            .Plays((m, pitch, dur) => Synth.Boom(Synth.Note(pitch), dur, m.Get("decay")));
+        Instrument("timp", "Timpani", "Timpani stroke tuned to the note.").Log("decay", "Decay", 0.1, 20.0, 2.8)
+            .Plays((m, pitch, dur) => Synth.Timp(Synth.Note(pitch), dur, m.Get("decay")));
+        Instrument("crash", "Crash", "Cymbal: bright noise with a long decay (pitch ignored).")
+            .Plays((m, pitch, dur) => Synth.Crash(dur));
+        Instrument("riser", "Riser", "Noise sweep rising through three bands (pitch ignored).")
+            .Lin("top", "Top level", 0.0, 2.0, 1.0).Log("tail", "Landing", 0.0, 1.0, 0.05)
+            .Plays((m, pitch, dur) => Synth.RiserIn(dur, m.Get("top"), m.Get("tail")));
+        Instrument("rumble", "Rumble", "Low rumble (pitch ignored).").Toggle("rise", "Swell in", true)
+            .Plays((m, pitch, dur) => Synth.Rumble(dur, m.Get("rise") > 0.5));
+        Instrument("shimmer", "Noise swell", "Band of noise swelling in and out over the note (pitch ignored).")
+            .Log("lo", "Low edge", 20.0, 16000.0, 3000.0).Log("hi", "High edge", 20.0, 20000.0, 9000.0).Lin("shape", "Swell shape", 0.25, 6.0, 2.0)
+            .Plays((m, pitch, dur) => Signal.Seconds(dur).Noise().Bandpass(m.Get("lo"), m.Get("hi")).SineWindow(m.Get("shape")));
+        Instrument("wind", "Wind", "Band of noise with slow swells that close at the note's end (pitch ignored).")
+            .Log("lo", "Low edge", 20.0, 16000.0, 180.0).Log("hi", "High edge", 20.0, 20000.0, 1100.0)
+            .Int("swells", "Swells", 1.0, 16.0, 3.0).Int("flutter", "Flutter", 0.0, 32.0, 7.0)
+            .Plays(Catalog.Wind);
+        Instrument("bed", "Breathing bed", "Sine snapped to whole cycles over the note, swelling with a shared breath.")
+            .Lin("depth", "Breath depth", 0.0, 1.0, 0.55).Int("c1", "Breath cycles 1", 1.0, 16.0, 2.0).Int("c2", "Breath cycles 2", 1.0, 16.0, 3.0)
+            .Int("c3", "Breath cycles 3", 1.0, 16.0, 5.0).Int("breathSeed", "Breath seed", 0.0, 999.0, 1.0)
+            .Plays((m, pitch, dur) => Signal.Seconds(dur).AddSine(Synth.Snap(Synth.Note(pitch), dur)).Mul(Breath(m, dur)));
+        Instrument("loopnoise", "Loop noise", "Noise band that repeats exactly over the note, with a breath (pitch ignored).")
+            .Log("lo", "Low edge", 20.0, 16000.0, 60.0).Log("hi", "High edge", 20.0, 20000.0, 260.0).Lin("depth", "Breath depth", 0.0, 1.0, 0.7)
+            .Int("c1", "Breath cycles 1", 1.0, 16.0, 3.0).Int("c2", "Breath cycles 2", 1.0, 16.0, 4.0).Int("c3", "Breath cycles 3", 1.0, 16.0, 7.0)
+            .Int("breathSeed", "Breath seed", 0.0, 999.0, 2.0)
+            .Plays((m, pitch, dur) => Synth.LoopNoise(dur, m.Get("lo"), m.Get("hi")).Mul(Breath(m, dur)));
+        Instrument("creak", "Creak", "Stick-slip creak ringing a big hollow hull (pitch ignored).")
+            .Lin("rateStart", "Rate at edges", 1.0, 60.0, 9.0).Lin("rateMid", "Rate mid", 1.0, 80.0, 26.0)
+            .Plays((m, pitch, dur) => Synth.Creak(dur, m.Get("rateStart"), m.Get("rateMid")));
+    }
+
+    static void AddEffects()
+    {
+        Effect("lowpass", "Low-pass", "One-pole low-pass.").Log("cutoff", "Cutoff", 20.0, 20000.0, 7000.0)
+            .Applies((s, fx, song) => s.Lowpass(fx.Get("cutoff")));
+        Effect("highpass", "High-pass", "One-pole high-pass.").Log("cutoff", "Cutoff", 20.0, 20000.0, 110.0)
+            .Applies((s, fx, song) => s.Highpass(fx.Get("cutoff")));
+        Effect("bandpass", "Band-pass", "Butterworth band-pass.")
+            .Log("lo", "Low edge", 20.0, 20000.0, 300.0).Log("hi", "High edge", 20.0, 20000.0, 3000.0).Int("order", "Order", 1.0, 8.0, 2.0)
+            .Applies((s, fx, song) => s.Butterworth(SynthFilter.Bandpass, (int)fx.Get("order"), fx.Get("lo"), fx.Get("hi")));
+        Effect("delay", "Delay", "Feedback echo timed in beats.").Lin("beats", "Time (beats)", 0.0625, 8.0, 0.75).Lin("feedback", "Feedback", 0.0, 0.95, 0.3)
+            .Applies((s, fx, song) => s.Delay(fx.Get("beats") * song.Beat(), fx.Get("feedback")));
+        Effect("hall", "Hall", "Schroeder hall reverb.").Lin("size", "Size", 0.2, 6.0, 2.4).Lin("feedback", "Feedback", 0.0, 0.97, 0.84).Lin("wet", "Wet", 0.0, 1.0, 0.35)
+            .Applies((s, fx, song) => s.Hall(fx.Get("size"), fx.Get("feedback"), fx.Get("wet")));
+        Effect("formants", "Vowel", "Shapes the sound into a vowel.").Choice("vowel", "Vowel", ["Ah", "AhHigh", "Oo"], 0).Lin("low", "Chest", 0.0, 1.0, 0.12)
+            .Applies((s, fx, song) => s.Formants(Vowel(fx), fx.Get("low")));
+        Effect("fftband", "Spectral band", "Zero-phase band through the spectrum.")
+            .Log("lo", "Low edge", 20.0, 20000.0, 200.0).Log("hi", "High edge", 20.0, 20000.0, 4000.0).Int("order", "Steepness", 1.0, 8.0, 2.0)
+            .Applies((s, fx, song) => s.FftBand(fx.Get("lo"), fx.Get("hi"), (int)fx.Get("order")));
+        Effect("tremolo", "Tremolo", "Volume wobble.").Lin("rate", "Rate", 0.05, 20.0, 4.0).Lin("depth", "Depth", 0.0, 1.0, 0.3)
+            .Applies((s, fx, song) => s.Tremolo(fx.Get("rate"), fx.Get("depth")));
+        Effect("gain", "Gain", "Volume in decibels.").Lin("db", "Gain (dB)", -48.0, 24.0, 0.0)
+            .Applies((s, fx, song) => s.Gain(Math.Pow(10.0, fx.Get("db") / 20.0)));
+        Effect("tanh", "Saturate", "Soft saturation towards a cap.").Lin("cap", "Cap", 0.05, 2.0, 0.9)
+            .Applies((s, fx, song) => s.Tanh(fx.Get("cap")));
+        Effect("softlimit", "Soft limit", "Unity below the knee, a soft shoulder up to the cap.").Lin("cap", "Cap", 0.05, 1.0, 0.8).Lin("knee", "Knee", 0.1, 1.0, 0.8)
+            .Applies((s, fx, song) => s.SoftLimit(fx.Get("cap"), fx.Get("knee")));
+        Effect("normalize", "Normalize", "Scales the track so one loop of it has this RMS (folding the tail in).").Lin("rms", "RMS", 0.001, 0.5, 0.05)
+            .Applies(Catalog.Normalize);
+        Effect("evenout", "Even out", "Slow leveller: passages above the median are turned down.").Lin("window", "Window (s)", 0.2, 10.0, 3.0).Lin("ratio", "Ratio", 0.0, 1.0, 0.5)
+            .Applies((s, fx, song) => s.EvenOut(fx.Get("window"), fx.Get("ratio")));
+    }
+
+    static float[] Vowel(Module m)
+    {
+        int index = (int)m.Get("vowel");
+        if (index == 1) { return Synth.AhHigh; }
+        if (index == 2) { return Synth.Oo; }
+        return Synth.Ah;
+    }
+
+    static Signal Tone(Module m, double pitch, double dur)
+    {
+        int set = (int)m.Get("partials");
+        double[] partials = set == 1 ? Synth.Bell : (set == 2 ? Synth.Glass : [1.0, 1.0, 2.0, m.Get("h2"), 3.0, m.Get("h3")]);
+        return Synth.Tone(Synth.Note(pitch), dur, m.Get("decay"), partials, m.Get("attack"));
+    }
+
+    static Signal Brass(Module m, double pitch, double dur)
+    {
+        double f = Synth.Note(pitch);
+        int players = (int)m.Get("players");
+        if (players <= 1) { return Synth.Brass(f, dur, m.Get("attack"), m.Get("release"), m.Get("bright")); }
+        Signal section = Signal.Seconds(dur);
+        double spread = m.Get("spread");
+        for (int p = 0; p < players; p++)
+        {
+            double cents = spread * (2.0 * p / (players - 1) - 1.0) + Synth.Range(-2.0, 2.0);
+            double late = Synth.Range(0.0, 0.035);
+            Signal one = Synth.Brass(f * Math.Pow(2.0, cents / 1200.0), Math.Max(0.01, dur - late), m.Get("attack") * Synth.Range(0.8, 1.3),
+                m.Get("release"), m.Get("bright") * Synth.Range(0.85, 1.15));
+            section.Mix(one, late, 1.0 / Math.Sqrt((double)players));
+        }
+        return section;
+    }
+
+    // 4/pi scales the odd-harmonic square wave to unit amplitude.
+    static Signal Square(Module m, double pitch, double dur)
+    {
+        Signal tone = Signal.Seconds(dur).AddOsc(Synth.Constant(Synth.Note(pitch), dur), 1.0, 4.0 / Math.PI, 0.0, SynthWave.Square, 12000.0);
+        return tone.EnvAR(m.Get("attack"), m.Get("release")).Lowpass(m.Get("cutoff"));
+    }
+
+    static Signal Ping(Module m, double pitch, double dur)
+    {
+        Signal sweep = Synth.Constant(Synth.Note(pitch), dur).Envelope([0.0f, 1.0f, (float)dur, (float)(1.0 - m.Get("drop") * dur)]);
+        return Signal.Seconds(dur).AddOsc(sweep).ExpDecay(m.Get("decay")).FadeIn(m.Get("attack"));
+    }
+
+    static Signal Wind(Module m, double pitch, double dur)
+    {
+        Signal swell = Signal.Seconds(dur).Fill(0.5).AddSine(m.Get("swells") / dur, 0.5, -Math.PI / 2.0);
+        if (m.Get("flutter") > 0.0) { swell.Mul(Signal.Seconds(dur).Fill(0.8).AddSine(2.0 * m.Get("flutter") / dur, 0.2, -Math.PI / 2.0)); }
+        return Signal.Seconds(dur).Noise().Bandpass(m.Get("lo"), m.Get("hi")).Mul(swell);
+    }
+
+    static Signal Breath(Module m, double dur)
+    {
+        Synth.Seed((long)m.Get("breathSeed") * 131 + 7);
+        int[] cycles = [(int)m.Get("c1"), (int)m.Get("c2"), (int)m.Get("c3")];
+        double depth = m.Get("depth");
+        return Synth.Gust(dur, dur, cycles).Gain(depth).Offset(1.0 - depth);
+    }
+
+    static Signal Normalize(Signal s, Module fx, Song song)
+    {
+        double rms = s.Fold(song.LoopSeconds()).Rms();
+        return rms > 1e-9 ? s.Gain(fx.Get("rms") / rms) : s;
+    }
+}

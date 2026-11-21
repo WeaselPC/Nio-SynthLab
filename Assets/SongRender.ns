@@ -1,0 +1,343 @@
+using NioEngine;
+
+public class SongRender
+{
+    Map<int, Signal> _stems = new Map<int, Signal>();
+    Map<int, string> _keys = new Map<int, string>();
+
+    // Pass a snapshot if the song can change between bake steps.
+    public BakeJob Begin(Song song) { return new BakeJob(this, song); }
+
+    public void Forget()
+    {
+        _stems.Clear();
+        _keys.Clear();
+    }
+
+    // Track index affects the noise seed.
+    public static string Key(Song song, int index)
+    {
+        Track t = song.tracks[index];
+        return $"{SongFile.Number(song.bpm)}|{song.beatsPerBar}|{song.bars}|{SongFile.Number(song.tail)}|{song.seed}|{index}|{Synth.SampleRate}|{SongFile.Number(t.gain)}|{SongFile.Number(t.tail)}\n"
+            + SongFile.Sound(t);
+    }
+
+    public Signal Cached(int index, string key)
+    {
+        string had = "";
+        return _keys.TryGetValue(index, out had) && had == key ? _stems.Get(index) : null;
+    }
+
+    public void Store(int index, string key, Signal stem)
+    {
+        _stems.Set(index, stem);
+        _keys.Set(index, key);
+    }
+
+    public void Trim(int trackCount)
+    {
+        foreach (int index in _keys.Keys())
+        {
+            if (index < trackCount) { continue; }
+            _stems.Remove(index);
+            _keys.Remove(index);
+        }
+    }
+
+    // Reseed each unit because previews share the generator.
+    public static long UnitSeed(Song song, int track, int unit)
+    {
+        return song.seed * 1000 + (long)track * 7919 + (long)unit * 104729 + 1;
+    }
+
+    public static void ApplyEffect(Song song, Signal s, Module fx)
+    {
+        if (fx.def != null && fx.def.isEffect) { fx.def.Apply(s, fx, song); }
+    }
+
+    enum Level { None, Rms, Limit }
+
+    public static Signal Finish(Song song, Signal mix)
+    {
+        Module f = song.finish;
+        Signal s = f.Get("fold") > 0.5 ? mix.Fold(song.LoopSeconds()) : mix;
+        if (f.Get("dc") > 0.5) { s.RemoveDc(); }
+        if (f.Get("even") > 0.5) { s.EvenOut(); }
+        Level level = (Level)(int)f.Get("mode");
+        if (level == Level.Rms && s.Rms() > 1e-9) { s.Gain(f.Get("rms") / s.Rms()); }
+        if (level == Level.Limit) { s.Level(f.Get("peak"), f.Get("rms"), f.Get("lufs"), 0.0, true); }
+        double cap = f.Get("tanh");
+        if (cap > 0.0 && s.Peak() > cap) { s.Tanh(cap); }
+        return s;
+    }
+
+    public static Signal Preview(Song song, Track t, Note n)
+    {
+        ModuleDef def = t.instrument.def;
+        double dur = n.length * song.Beat() + t.tail;
+        Signal s;
+        if (def == null || !def.isInstrument) { s = Signal.Seconds(dur); }
+        else if (def.legato) { s = def.Sing(t.instrument, [0.0f, (float)n.pitch], dur); }
+        else { s = def.Play(t.instrument, n.pitch, dur); }
+        s.Gain(t.gain * n.velocity);
+        Signal padded = Signal.Seconds(s.Duration + 2.0);
+        padded.Mix(s);
+        for (int i = 0; i < t.effects.Count(); i++)
+        {
+            // Normalization needs the whole track.
+            if (t.effects[i].kind != "normalize") { ApplyEffect(song, padded, t.effects[i]); }
+        }
+        return padded;
+    }
+
+    public static List<Note> Sorted(List<Note> notes)
+    {
+        List<Note> sorted = new List<Note>();
+        sorted.AddRange(notes);
+        sorted.Sort((Note a, Note b) => a.start < b.start ? -1 : (a.start > b.start ? 1 : 0));
+        return sorted;
+    }
+
+    // Join touching notes by nearest pitch to preserve parallel legato lines.
+    public static List<List<Note>> Phrases(List<Note> sorted)
+    {
+        List<List<Note>> phrases = new List<List<Note>>();
+        for (int i = 0; i < sorted.Count(); i++)
+        {
+            Note n = sorted[i];
+            int best = -1;
+            double bestDistance = 1e9;
+            for (int p = 0; p < phrases.Count(); p++)
+            {
+                Note last = phrases[p][phrases[p].Count() - 1];
+                if (Math.Abs(last.End() - n.start) < 1e-4 && Math.Abs(last.pitch - n.pitch) < bestDistance)
+                {
+                    best = p;
+                    bestDistance = Math.Abs(last.pitch - n.pitch);
+                }
+            }
+            if (best < 0)
+            {
+                List<Note> line = new List<Note>();
+                line.Add(n);
+                phrases.Add(line);
+            }
+            else
+            {
+                phrases[best].Add(n);
+            }
+        }
+        return phrases;
+    }
+}
+
+public enum BakeStage
+{
+    OpenTrack,
+    Notes,
+    TrackEffects,
+    MasterEffects,
+    Finish,
+    Measure,
+    Loudness,
+    Done
+}
+
+public class BakeJob
+{
+    public Song song;
+    public Signal result;
+    public int serial;
+    public double workMs;
+    public int rendered;
+    public int cached;
+    public double rms;
+    public double peak;
+    public double lufs;
+
+    SongRender _owner;
+    BakeStage _stage = BakeStage.OpenTrack;
+    string[] _keys;
+    bool _anySolo;
+    Signal _mix;
+    Signal _finished;
+    double _lastStepMs;
+    int _done;
+    int _total;
+
+    int _track;
+    Signal _stem;
+    List<Note> _notes;
+    List<List<Note>> _phrases;
+    int _unit;
+    int _units;
+    int _fx;
+
+    public BakeJob(SongRender owner, Song song)
+    {
+        _owner = owner;
+        this.song = song;
+        _owner.Trim(song.tracks.Count());
+        _mix = Signal.Seconds(song.LoopSeconds() + song.tail);
+        _keys = new string[song.tracks.Count()];
+        for (int i = 0; i < song.tracks.Count(); i++)
+        {
+            Track t = song.tracks[i];
+            if (t.solo) { _anySolo = true; }
+            _keys[i] = SongRender.Key(song, i);
+            if (_owner.Cached(i, _keys[i]) == null) { _total += t.notes.Count() + t.effects.Count(); }
+        }
+        _total += song.master.Count() + 3;
+    }
+
+    public double Progress() { return _total > 0 ? Math.Min(1.0, (double)_done / (double)_total) : 1.0; }
+
+    public bool Run(double budgetMs)
+    {
+        double start = Clock();
+        while (!Step())
+        {
+            if ((Clock() - start) * 1000.0 + _lastStepMs >= budgetMs) { return false; }
+        }
+        return true;
+    }
+
+    public bool Step()
+    {
+        if (_stage == BakeStage.Done) { return true; }
+        double start = Clock();
+        DoStep();
+        _lastStepMs = (Clock() - start) * 1000.0;
+        workMs += _lastStepMs;
+        return _stage == BakeStage.Done;
+    }
+
+    void DoStep()
+    {
+        switch (_stage)
+        {
+            case BakeStage.OpenTrack:
+                OpenTrack();
+                break;
+            case BakeStage.Notes:
+                if (_unit < _units)
+                {
+                    RenderUnit();
+                    _unit++;
+                    _done++;
+                }
+                else
+                {
+                    _stage = BakeStage.TrackEffects;
+                    _fx = 0;
+                }
+                break;
+            case BakeStage.TrackEffects:
+                Track t = song.tracks[_track];
+                if (_fx < t.effects.Count())
+                {
+                    Synth.Seed(SongRender.UnitSeed(song, _track, 100000 + _fx));
+                    SongRender.ApplyEffect(song, _stem, t.effects[_fx]);
+                    _fx++;
+                    _done++;
+                }
+                else
+                {
+                    _owner.Store(_track, _keys[_track], _stem);
+                    rendered++;
+                    MixIn(_stem);
+                    _stem = null;
+                    _stage = BakeStage.OpenTrack;
+                }
+                break;
+            case BakeStage.MasterEffects:
+                if (_fx < song.master.Count())
+                {
+                    Synth.Seed(SongRender.UnitSeed(song, song.tracks.Count(), 100000 + _fx));
+                    SongRender.ApplyEffect(song, _mix, song.master[_fx]);
+                    _fx++;
+                    _done++;
+                }
+                else { _stage = BakeStage.Finish; }
+                break;
+            case BakeStage.Finish:
+                _finished = SongRender.Finish(song, _mix);
+                _stage = BakeStage.Measure;
+                _done++;
+                break;
+            case BakeStage.Measure:
+                rms = _finished.Rms();
+                peak = _finished.Peak();
+                _stage = BakeStage.Loudness;
+                _done++;
+                break;
+            case BakeStage.Loudness:
+                lufs = _finished.Lufs();
+                result = _finished;
+                _stage = BakeStage.Done;
+                _done++;
+                break;
+        }
+    }
+
+    void OpenTrack()
+    {
+        if (_track >= song.tracks.Count())
+        {
+            _stage = BakeStage.MasterEffects;
+            _fx = 0;
+            return;
+        }
+        Signal hit = _owner.Cached(_track, _keys[_track]);
+        if (hit != null)
+        {
+            cached++;
+            MixIn(hit);
+            return;
+        }
+        Track t = song.tracks[_track];
+        ModuleDef def = t.instrument.def;
+        bool playable = def != null && def.isInstrument;
+        _stem = Signal.Seconds(song.LoopSeconds() + song.tail);
+        _notes = SongRender.Sorted(t.notes);
+        _phrases = playable && def.legato ? SongRender.Phrases(_notes) : null;
+        _units = !playable ? 0 : (_phrases != null ? _phrases.Count() : _notes.Count());
+        _unit = 0;
+        // Progress counts notes even when one step renders a whole phrase.
+        _done += t.notes.Count() - _units;
+        _stage = BakeStage.Notes;
+    }
+
+    void RenderUnit()
+    {
+        Track t = song.tracks[_track];
+        Synth.Seed(SongRender.UnitSeed(song, _track, _unit));
+        double beat = song.Beat();
+        if (_phrases != null)
+        {
+            List<Note> line = _phrases[_unit];
+            double startBeats = line[0].start;
+            float[] points = new float[line.Count() * 2];
+            for (int k = 0; k < line.Count(); k++)
+            {
+                points[k * 2] = (float)((line[k].start - startBeats) * beat);
+                points[k * 2 + 1] = (float)line[k].pitch;
+            }
+            double dur = (line[line.Count() - 1].End() - startBeats) * beat + t.tail;
+            _stem.Mix(t.instrument.def.Sing(t.instrument, points, dur), startBeats * beat, t.gain * line[0].velocity);
+            return;
+        }
+        Note n = _notes[_unit];
+        double length = n.length * beat + t.tail;
+        if (length <= 0.001) { return; }
+        _stem.Mix(t.instrument.def.Play(t.instrument, n.pitch, length), n.start * beat, t.gain * n.velocity);
+    }
+
+    void MixIn(Signal stem)
+    {
+        Track t = song.tracks[_track];
+        bool audible = _anySolo ? t.solo : !t.mute;
+        if (audible) { _mix.Mix(stem); }
+        _track++;
+    }
+}
