@@ -24,6 +24,7 @@ the loop in `Assets/Audio/`.
 ## Shortcuts
 
 | | |
+| --- | --- |
 | <kbd>Space</kbd> | Play / stop |
 | <kbd>Ctrl</kbd> + <kbd>S</kbd> | Save |
 | <kbd>Ctrl</kbd> + <kbd>Z</kbd> | Undo |
