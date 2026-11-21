@@ -21,6 +21,11 @@ run it. Press <kbd>Space</kbd> to hear the demo song.
 Songs save as plain text in a `Songs/` folder next to the app, and **Export WAV** drops
 the loop in `Assets/Audio/`.
 
+## AI disclaimer
+  AI (Claude Opus 5.6) was used to setup catalogue (effects, instruments) - I'm not a musician :)
+  
+  Some instrument name & descriptions are a bit vague, will probably fix them at some point
+
 ## Shortcuts
 
 | | |
