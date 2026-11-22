@@ -11,6 +11,8 @@ public static class WidgetId
     public const int OpenMenu = 7;
     public const int AddTrack = 8;
     public const int Snap = 9;
+    public const int Extend = 10;
+    public const int Midi = 11;
 
     public const int FinishBlock = 1;
     public const int InstrumentBlock = 2;
@@ -44,6 +46,7 @@ public class SynthLabApp : Entity
     const string AutosavePref = "synthlab.autosave";
     const string VolumePref = "synthlab.volume";
 
+    const int MaxBars = 256;
     const double BakeFps = 30.0;
     const double FrameMs = 1000.0 / BakeFps;
 
@@ -53,6 +56,7 @@ public class SynthLabApp : Entity
     Song _song;
     int _track;
     PianoRoll _roll;
+    MidiKeys _keys;
     LoopPlayer _player;
     SongRender _render = new SongRender();
 
@@ -133,6 +137,7 @@ public class SynthLabApp : Entity
         RefreshFiles();
         _filesTimer = Invoke.Every(3.0f, () => RefreshFiles());
 
+        _keys = new MidiKeys(this, _roll);
         _roll.Place(Layout().roll);
         string unsaved = Prefs.GetString(AutosavePref, "");
         string last = Prefs.GetString(LastSongPref, "");
@@ -144,6 +149,7 @@ public class SynthLabApp : Entity
     public override void OnDestroy()
     {
         _filesTimer.Cancel();
+        _keys.Shutdown();
     }
 
     public override void OnUpdate(float deltaTime)
@@ -152,6 +158,7 @@ public class SynthLabApp : Entity
         Panels panels = Layout();
         _roll.Place(panels.roll);
         _player.Update();
+        _keys.Update(deltaTime);
 
         Ui.Begin(deltaTime);
         Screen.GetUIRect().Draw(Ui.Bg, true);
@@ -174,16 +181,22 @@ public class SynthLabApp : Entity
         Bake((double)deltaTime * 1000.0);
     }
 
+    // The top bar needs this much width to fit on one row.
+    const float WideTopBar = 1250.0f;
+    const float TopRow = 29.0f;
+
     static Panels Layout()
     {
         Rect screen = Screen.GetUIRect();
+        float width = screen.width;
         Panels panels = Panels();
-        panels.top = screen.CutTop(44.0f);
+        // Narrower screens, such as 4:3, stack the top bar in two rows and slim the side panels.
+        panels.top = screen.CutTop(width < WideTopBar ? TopRow * 2.0f + 20.0f : TopRow + 15.0f);
         panels.status = screen.CutBottom(22.0f);
         screen.Grow(-Ui.Gap);
-        panels.tracks = screen.CutLeft(206.0f);
+        panels.tracks = screen.CutLeft(Mathf.Clamp(width * 0.161f, 170.0f, 206.0f));
         screen.CutLeft(Ui.Gap);
-        panels.inspector = screen.CutRight(322.0f);
+        panels.inspector = screen.CutRight(Mathf.Clamp(width * 0.2516f, 250.0f, 322.0f));
         screen.CutRight(Ui.Gap);
         panels.wave = screen.CutBottom(50.0f);
         screen.CutBottom(Ui.Gap);
@@ -209,6 +222,7 @@ public class SynthLabApp : Entity
     internal int editSerial => _editSerial;
     internal bool playing => _transport == Transport.Playing;
     internal double head => playing ? _player.Beats : _cursorBeats;
+    internal double volume => _volume;
 
     internal double cursor
     {
@@ -284,6 +298,42 @@ public class SynthLabApp : Entity
         _undo.Add(_committed);
         Restore(_redo.RemoveAt(_redo.Count() - 1));
         Flash("Redo");
+    }
+
+    // Makes the song longer by repeating its last bars on every track. Zero repeats the whole song.
+    internal void Extend(int bars)
+    {
+        bars = bars <= 0 ? _song.bars : Math.Min(bars, _song.bars);
+        if (_song.bars + bars > MaxBars)
+        {
+            Flash($"A song can be at most {MaxBars} bars");
+            return;
+        }
+        double span = (double)(bars * _song.beatsPerBar);
+        double end = _song.LoopBeats();
+        double from = end - span;
+        int copied = 0;
+        for (int ti = 0; ti < _song.tracks.Count(); ti++)
+        {
+            Track t = _song.tracks[ti];
+            int count = t.notes.Count();
+            for (int i = 0; i < count; i++)
+            {
+                Note n = t.notes[i];
+                if (n.start < from - 1e-9 || n.start >= end - 1e-9) { continue; }
+                // Notes already placed past the loop end stay as they are.
+                if (PianoRoll.NoteAt(t, n.start + span, n.pitch) != null) { continue; }
+                Note copy = n.Copy();
+                copy.start += span;
+                t.notes.Add(copy);
+                copied++;
+            }
+        }
+        _song.bars += bars;
+        Commit();
+        _roll.Reveal(end);
+        string what = bars == 1 ? "the last bar" : $"the last {bars} bars";
+        Flash($"Repeated {what} ({copied} notes): the song is now {_song.bars} bars");
     }
 
     internal void Flash(string message)
@@ -584,9 +634,33 @@ public class SynthLabApp : Entity
 
     void TopBar(Rect r)
     {
+        bool stacked = r.height > TopRow * 2.0f;
         r.Draw(Ui.Panel, true);
         r.CutBottom(1.0f).Draw(Ui.Line, true);
         r.Grow(-7.0f, -Ui.Gap, -7.0f, -Ui.Gap);
+        if (!stacked)
+        {
+            SongName(ref r);
+            SongNumbers(ref r);
+            TransportButtons(ref r);
+            r.CutRight(4.0f);
+            VolumeField(ref r);
+            r.CutRight(10.0f);
+            FileButtons(ref r);
+            return;
+        }
+        Rect lower = r.CutBottom(TopRow);
+        r.CutBottom(5.0f);
+        SongName(ref r);
+        TransportButtons(ref r);
+        r.CutRight(10.0f);
+        FileButtons(ref r);
+        SongNumbers(ref lower);
+        VolumeField(ref lower);
+    }
+
+    void SongName(ref Rect r)
+    {
         if (_logo != null)
         {
             Rect logo = r.CutLeft(34.0f);
@@ -602,10 +676,14 @@ public class SynthLabApp : Entity
         if (renamed) { Commit(); }
         Ui.Tip(name, "Song name; also the file name when saving and exporting.");
         r.CutLeft(8.0f);
+    }
 
+    void SongNumbers(ref Rect r)
+    {
         _song.bpm = Ui.Number(r.CutLeft(86.0f), WidgetId.Bpm, "BPM", _song.bpm, 20.0, 300.0, 1.0, 0, "Tempo. Drag sideways or scroll; Shift for slower dragging.");
         r.CutLeft(4.0f);
-        _song.bars = (int)Ui.Number(r.CutLeft(70.0f), WidgetId.Bars, "Bars", (double)_song.bars, 1.0, 256.0, 1.0, 0, "Loop length in bars.");
+        _song.bars = (int)Ui.Number(r.CutLeft(70.0f), WidgetId.Bars, "Bars", (double)_song.bars, 1.0, (double)MaxBars, 1.0, 0,
+            "Loop length in bars. Extend in the piano roll toolbar adds bars with a copy of the last ones.");
         r.CutLeft(4.0f);
         _song.beatsPerBar = (int)Ui.Number(r.CutLeft(66.0f), WidgetId.Meter, "Beats", (double)_song.beatsPerBar, 1.0, 16.0, 1.0, 0, "Beats per bar.");
         r.CutLeft(4.0f);
@@ -614,7 +692,10 @@ public class SynthLabApp : Entity
         r.CutLeft(4.0f);
         _song.seed = (long)Ui.Number(r.CutLeft(78.0f), WidgetId.Seed, "Seed", (double)_song.seed, 0.0, 99999.0, 1.0, 0,
             "Random seed for noise, detune and chorus. The same seed gives the same bake.");
+    }
 
+    void TransportButtons(ref Rect r)
+    {
         bool waiting = _transport == Transport.WaitingForBake;
         string playLabel = playing ? "Stop" : (waiting && _job != null ? $"Baking {_job.Progress() * 100.0:F0}%" : "Play");
         if (Ui.Button(r.CutRight(92.0f), playLabel, playing || waiting,
@@ -622,7 +703,10 @@ public class SynthLabApp : Entity
         r.CutRight(4.0f);
         _live = Ui.Toggle(r.CutRight(52.0f), "Live", _live,
             "While playing, re-bake after every edit and keep playing from the same spot. Off: edits made while playing are baked once you stop.");
-        r.CutRight(4.0f);
+    }
+
+    void VolumeField(ref Rect r)
+    {
         double volume = Ui.Number(r.CutRight(78.0f), WidgetId.Volume, "Vol", _volume * 100.0, 0.0, 100.0, 5.0, 0, "Playback volume (not part of the song).") / 100.0;
         if (volume != _volume)
         {
@@ -630,7 +714,10 @@ public class SynthLabApp : Entity
             _player.Volume = volume;
             Prefs.SetFloat(VolumePref, (float)volume);
         }
-        r.CutRight(10.0f);
+    }
+
+    void FileButtons(ref Rect r)
+    {
         if (Ui.Button(r.CutRight(82.0f), "Export WAV", false, "Write the baked loop to Assets/Audio/<name>.wav, imported looping when Fold is on.")) { Export(); }
         r.CutRight(4.0f);
         if (Ui.Button(r.CutRight(56.0f), _committed != _savedText ? "Save *" : "Save", false,
@@ -649,6 +736,8 @@ public class SynthLabApp : Entity
         else if (pick == 1) { Revert(); }
         else if (pick == 2 && actions > 2) { SavePreset(); }
         else if (pick >= actions) { LoadFile(_files[pick - actions]); }
+        r.CutRight(10.0f);
+        _keys.TopBar(r);
     }
 
     void StatusBar(Rect r)

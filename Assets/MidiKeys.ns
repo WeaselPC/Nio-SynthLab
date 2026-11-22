@@ -1,0 +1,214 @@
+using NioEngine;
+
+// A MIDI keyboard: its keys play the selected track's instrument and, with Rec on, write notes into the piano roll.
+public class MidiKeys
+{
+    const string DevicePref = "synthlab.midi";
+    const int Voices = 8;
+    // Shortest fade when a key is released, to avoid a click.
+    const double MinFade = 0.03;
+
+    SynthLabApp _app;
+    PianoRoll _roll;
+    string[] _menu = [];
+    byte[] _events = new byte[384];
+    bool _record;
+
+    List<AudioComponent> _voices = new List<AudioComponent>();
+    AudioFile[] _clips = new AudioFile[Voices];
+    int[] _voicePitch = new int[Voices];
+    double[] _fade = new double[Voices];
+    double[] _fadeLeft = new double[Voices];
+    int _nextVoice;
+
+    bool[] _held = new bool[128];
+    Track[] _recordTrack = new Track[128];
+    double[] _recordStart = new double[128];
+    double[] _recordVelocity = new double[128];
+
+    public MidiKeys(SynthLabApp app, PianoRoll roll)
+    {
+        _app = app;
+        _roll = roll;
+        for (int i = 0; i < Voices; i++)
+        {
+            Entity voice = Entity.Create(Vec2f.Zero);
+            voice.name = $"Synth Lab MIDI key {i + 1}";
+            _voices.Add(voice.AddComponent<AudioComponent>());
+            _voicePitch[i] = -1;
+        }
+        Scan();
+        string last = Prefs.GetString(DevicePref, "");
+        for (int i = 0; i < MidiIn.Count(); i++)
+        {
+            if (last != "" && MidiIn.Name(i) == last) { MidiIn.Open(i); }
+        }
+    }
+
+    public void Shutdown()
+    {
+        MidiIn.Shutdown();
+    }
+
+    void Scan()
+    {
+        MidiIn.Scan();
+        _menu = new string[MidiIn.Count() + 2];
+        _menu[0] = "Off";
+        _menu[1] = "Rescan devices";
+        for (int i = 0; i < MidiIn.Count(); i++) { _menu[i + 2] = MidiIn.Name(i); }
+    }
+
+    public void Update(float deltaTime)
+    {
+        int count = MidiIn.Read(_events);
+        for (int i = 0; i < count; i++)
+        {
+            int kind = (int)_events[i * 3] & 0xF0;
+            int pitch = (int)_events[i * 3 + 1] & 0x7F;
+            int velocity = (int)_events[i * 3 + 2] & 0x7F;
+            // A note-on with no velocity is a note-off.
+            if (kind == 0x90 && velocity > 0) { NoteOn(pitch, (double)velocity / 127.0); }
+            else if (kind == 0x80 || kind == 0x90) { NoteOff(pitch); }
+        }
+        for (int v = 0; v < Voices; v++)
+        {
+            if (_fadeLeft[v] <= 0.0) { continue; }
+            _fadeLeft[v] -= (double)deltaTime;
+            if (_fadeLeft[v] > 0.0) { _voices[v].volume = (float)(_app.volume * _fadeLeft[v] / _fade[v]); }
+            else
+            {
+                _voices[v].Stop();
+                _voicePitch[v] = -1;
+            }
+        }
+    }
+
+    public void TopBar(Rect r)
+    {
+        if (r.width < 150.0f) { return; }
+        if (MidiIn.isOpen)
+        {
+            _record = Ui.Toggle(r.CutRight(40.0f), "Rec", _record,
+                "Record: while the song plays, the notes you play on the MIDI keyboard are written into the selected track at the playhead, using the piano roll's snap.");
+            r.CutRight(4.0f);
+        }
+        string label = MidiIn.isOpen ? Short(MidiIn.openName) : "MIDI in";
+        int pick = Ui.Menu(r.CutRight(100.0f), WidgetId.Midi, label, _menu,
+            "MIDI keyboard. Pick a device to play the selected track's instrument from its keys; a released key fades over the track's note tail. Rescan after plugging a device in.");
+        if (pick == 0)
+        {
+            Release();
+            MidiIn.Close();
+            Prefs.SetString(DevicePref, "");
+        }
+        else if (pick == 1)
+        {
+            string name = MidiIn.openName;
+            Release();
+            Scan();
+            for (int i = 0; i < MidiIn.Count(); i++)
+            {
+                if (name != "" && MidiIn.Name(i) == name) { MidiIn.Open(i); }
+            }
+            _app.Flash(MidiIn.Count() == 1 ? "Found 1 MIDI input" : $"Found {MidiIn.Count()} MIDI inputs");
+        }
+        else if (pick >= 2)
+        {
+            Release();
+            string name = MidiIn.Name(pick - 2);
+            if (MidiIn.Open(pick - 2))
+            {
+                Prefs.SetString(DevicePref, name);
+                _app.Flash("MIDI in: " + name);
+            }
+            else { _app.Flash("Could not open " + name + ": another program may be using it"); }
+        }
+    }
+
+    static string Short(string name) { return name.Length() > 15 ? name.Substring(0, 13) + ".." : name; }
+
+    void Release()
+    {
+        for (int pitch = 0; pitch < 128; pitch++)
+        {
+            if (_held[pitch]) { NoteOff(pitch); }
+        }
+    }
+
+    void NoteOn(int pitch, double velocity)
+    {
+        Track t = _app.track;
+        if (t == null) { return; }
+        if (_held[pitch]) { NoteOff(pitch); }
+        _held[pitch] = true;
+        _roll.HoldKey(pitch, true);
+        Play(t, pitch, velocity);
+        _recordTrack[pitch] = _record && _app.playing ? t : null;
+        _recordStart[pitch] = _app.head;
+        _recordVelocity[pitch] = velocity;
+    }
+
+    void NoteOff(int pitch)
+    {
+        if (!_held[pitch]) { return; }
+        _held[pitch] = false;
+        _roll.HoldKey(pitch, false);
+        for (int v = 0; v < Voices; v++)
+        {
+            if (_voicePitch[v] != pitch || _fadeLeft[v] > 0.0) { continue; }
+            _fade[v] = Math.Max(MinFade, _fade[v]);
+            _fadeLeft[v] = _fade[v];
+        }
+        Track t = _recordTrack[pitch];
+        _recordTrack[pitch] = null;
+        if (t != null && _app.song.tracks.Contains(t)) { Record(t, pitch); }
+    }
+
+    void Play(Track t, int pitch, double velocity)
+    {
+        int v = FreeVoice();
+        AudioFile old = _clips[v];
+        _clips[v] = SongRender.Preview(_app.song, t, new Note(0.0, 4.0, (double)pitch, velocity)).ToAudio(false, "midi key");
+        _voices[v].audio = _clips[v];
+        _voices[v].volume = (float)_app.volume;
+        _voices[v].Play();
+        _voicePitch[v] = pitch;
+        _fade[v] = t.tail;
+        _fadeLeft[v] = 0.0;
+        // The audio thread may still have a queued Play for the old clip.
+        if (old != null) { Invoke.After(0.5f, () => Synth.ReleaseAudio(old)); }
+    }
+
+    // An idle voice, else one that is fading out, else the next in turn.
+    int FreeVoice()
+    {
+        for (int v = 0; v < Voices; v++)
+        {
+            if (_voicePitch[v] < 0) { return v; }
+        }
+        for (int v = 0; v < Voices; v++)
+        {
+            if (_fadeLeft[v] > 0.0) { return v; }
+        }
+        _nextVoice = (_nextVoice + 1) % Voices;
+        return _nextVoice;
+    }
+
+    void Record(Track t, int pitch)
+    {
+        double loop = _app.song.LoopBeats();
+        double start = _roll.Snap(_recordStart[pitch]);
+        double end = _app.head;
+        bool wrapped = end < _recordStart[pitch];
+        // A note played just before the loop restarts belongs on its first beat.
+        if (start >= loop - 1e-9)
+        {
+            start = 0.0;
+            if (!wrapped) { end = 0.0; }
+        }
+        else if (wrapped) { end = loop; }
+        double length = Math.Max(_roll.NudgeBeats(), _roll.Snap(end) - start);
+        _roll.AddRecorded(t, new Note(start, length, (double)pitch, _recordVelocity[pitch]));
+    }
+}

@@ -71,6 +71,9 @@ public class SongRender
         return s;
     }
 
+    // Peak level of a previewed note at full velocity.
+    const double PreviewPeak = 0.4;
+
     public static Signal Preview(Song song, Track t, Note n)
     {
         ModuleDef def = t.instrument.def;
@@ -87,6 +90,9 @@ public class SongRender
             // Normalization needs the whole track.
             if (t.effects[i].kind != "normalize") { ApplyEffect(song, padded, t.effects[i]); }
         }
+        // A bake levels the whole mix, which a lone note at its track gain never gets, so previews use a fixed level.
+        double peak = padded.Peak();
+        if (peak > 1e-6) { padded.Gain(PreviewPeak * n.velocity / peak); }
         return padded;
     }
 

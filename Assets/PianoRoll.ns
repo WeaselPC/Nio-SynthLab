@@ -30,6 +30,9 @@ public class PianoRoll
 
     static string[] SnapNames = ["Off", "1/16", "1/8", "1/4", "1/2", "Beat", "Bar"];
     static double[] SnapBeats = [0.0, 0.0625, 0.125, 0.25, 0.5, 1.0, 0.0];
+    static string[] ExtendNames = ["Repeat last bar", "Repeat last 2 bars", "Repeat last 4 bars", "Repeat last 8 bars", "Repeat whole song"];
+    // Zero is the whole song.
+    static int[] ExtendBars = [1, 2, 4, 8, 0];
     const int SnapBar = 6;
 
     static string[] s_noteNames;
@@ -56,12 +59,14 @@ public class PianoRoll
     double _contentBeats;
 
     int _snap = 2;
+    bool _select;
     bool _ghosts = true;
     bool _audition = true;
     bool _follow;
 
     List<Note> _selection = new List<Note>();
     List<Note> _clipboard = new List<Note>();
+    List<Note> _boxed = new List<Note>();
 
     Gesture _gesture = Gesture.None;
     bool _ending;
@@ -82,6 +87,7 @@ public class PianoRoll
     double[] _beforeDrag;
     double _auditionedPitch = -1.0;
     int _keyPitch = -1;
+    bool[] _heldKeys = new bool[128];
     double _lastLength = 1.0;
 
     // Defer overlap trimming so nudges can pass through other notes.
@@ -125,6 +131,17 @@ public class PianoRoll
     }
 
     public void ClearSelection() { _selection.Clear(); }
+
+    internal void HoldKey(int pitch, bool held) { _heldKeys[pitch] = held; }
+
+    internal void AddRecorded(Track t, Note n)
+    {
+        t.notes.Add(n);
+        List<Note> added = new List<Note>();
+        added.Add(n);
+        MakeRoom(t, added);
+        _app.Commit();
+    }
 
     public void Fit()
     {
@@ -177,28 +194,19 @@ public class PianoRoll
         }
         if (Input.IsKeyPressedThisFrame(KeyCode.PageUp)) { _glidePitch += 12.0; }
         if (Input.IsKeyPressedThisFrame(KeyCode.PageDown)) { _glidePitch -= 12.0; }
+        if (!ctrl && Input.IsKeyPressedThisFrame(KeyCode.S)) { _select = !_select; }
 
         Track t = _app.track;
         if (t == null) { return; }
         if (Input.IsKeyPressedThisFrame(KeyCode.Escape)) { _selection.Clear(); }
-        if (Input.IsKeyPressedThisFrame(KeyCode.Delete) || Input.IsKeyPressedThisFrame(KeyCode.Backspace))
-        {
-            for (int i = 0; i < _selection.Count(); i++) { t.notes.Remove(_selection[i]); }
-            _selection.Clear();
-            _app.StopPreview();
-            _app.Commit();
-        }
+        if (Input.IsKeyPressedThisFrame(KeyCode.Delete) || Input.IsKeyPressedThisFrame(KeyCode.Backspace)) { DeleteSelection(t); }
         if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.A))
         {
             _selection.Clear();
             _selection.AddRange(t.notes);
         }
-        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.C))
-        {
-            _clipboard.Clear();
-            for (int i = 0; i < _selection.Count(); i++) { _clipboard.Add(_selection[i].Copy()); }
-            _app.Flash($"Copied {_clipboard.Count()} notes");
-        }
+        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.C)) { CopySelection("Copied"); }
+        if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.X) && CopySelection("Cut")) { DeleteSelection(t); }
         if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.V) && _clipboard.Count() > 0) { Paste(t); }
         if (ctrl && Input.IsKeyPressedThisFrame(KeyCode.D) && _selection.Count() > 0) { Duplicate(t); }
 
@@ -238,6 +246,7 @@ public class PianoRoll
         Toolbar(t);
         Navigate();
         PlayKeys(t);
+        UpdateBox(t);
         DrawRows();
         DrawTimeline(song);
         DrawNotes(song, t);
@@ -288,13 +297,13 @@ public class PianoRoll
 
     double SnapSize() { return _snap == SnapBar ? (double)_app.song.beatsPerBar : SnapBeats[_snap]; }
 
-    double Snap(double beat)
+    internal double Snap(double beat)
     {
         double size = SnapSize();
         return size > 0.0 ? Math.Round(beat / size) * size : beat;
     }
 
-    double NudgeBeats()
+    internal double NudgeBeats()
     {
         double size = SnapSize();
         return size > 0.0 ? size : 0.0625;
@@ -532,6 +541,9 @@ public class PianoRoll
         Rect bar = _toolbar;
         _snap = Ui.Dropdown(bar.CutLeft(92.0f), WidgetId.Snap, SnapNames, _snap, "Grid snap for placing, moving and resizing notes.");
         bar.CutLeft(4.0f);
+        _select = Ui.Toggle(bar.CutLeft(54.0f), "Select", _select,
+            "Select tool (S): dragging over empty space selects the notes in the box instead of adding one. Off, Ctrl+drag does the same. Shift adds to the selection. Drag any selected note to move them all; Ctrl+C, X, V and D copy, cut, paste and duplicate.");
+        bar.CutLeft(4.0f);
         _ghosts = Ui.Toggle(bar.CutLeft(62.0f), "Ghosts", _ghosts, "Show the other tracks' notes faintly.");
         bar.CutLeft(4.0f);
         _audition = Ui.Toggle(bar.CutLeft(70.0f), "Audition", _audition, "Play a note when you place it or change its pitch, for as long as you hold it.");
@@ -543,10 +555,17 @@ public class PianoRoll
         if (Ui.Button(bar.CutLeft(26.0f), "+", false, "Zoom time in (+). Ctrl+wheel zooms time at the mouse.")) { ZoomAtHead(1.25); }
         bar.CutLeft(2.0f);
         if (Ui.Button(bar.CutLeft(34.0f), "Fit", false, "Show the whole song and every note of this track (F). Z frames just the selected notes.")) { Fit(); }
-        if (t == null) { return; }
-        ModuleDef def = t.instrument.def;
+        bar.CutLeft(4.0f);
+        int extend = Ui.Menu(bar.CutLeft(56.0f), WidgetId.Extend, "Extend", ExtendNames,
+            "Make the song longer: adds bars at the end holding a copy of the last ones, on every track.");
+        if (extend >= 0) { _app.Extend(ExtendBars[extend]); }
         bar.CutLeft(10.0f);
+        // The track list and inspector name the track too, so a narrow roll drops this label.
+        if (t == null || bar.width < 90.0f) { return; }
+        ModuleDef def = t.instrument.def;
+        RectCmd.SetClip(bar);
         Ui.Label(bar, t.name + "  -  " + (def != null ? def.label : t.instrument.kind), Ui.TrackColor(_app.trackIndex), 4.2f);
+        RectCmd.ClearClip();
         if (def == null) { return; }
         Ui.Tip(bar, def.legato ? def.help + " A note that starts exactly where another ends continues its line and glides into it." : def.help);
     }
@@ -591,7 +610,8 @@ public class PianoRoll
             bool black = IsBlack(pitch);
             if (black) { Rect(_grid.min.x, y0, _grid.max.x, y1).Draw(Color(0.0f, 0.0f, 0.0f, 0.18f), true); }
             Rect key = Rect(_keys.min.x, y0, _keys.max.x, y1);
-            key.Draw(pitch == _keyPitch ? Ui.Accent : (black ? Color(0.1f, 0.105f, 0.12f, 1.0f) : Color(0.7f, 0.72f, 0.76f, 1.0f)), true);
+            bool held = pitch == _keyPitch || (pitch >= 0 && pitch < 128 && _heldKeys[pitch]);
+            key.Draw(held ? Ui.Accent : (black ? Color(0.1f, 0.105f, 0.12f, 1.0f) : Color(0.7f, 0.72f, 0.76f, 1.0f)), true);
             if (pitch % 12 == 0)
             {
                 Rect(_grid.min.x, y0, _grid.max.x, y0 + 1.0f).Draw(Ui.Line, true);
@@ -700,7 +720,7 @@ public class PianoRoll
                 Rect r = NoteRect(n);
                 if (r.max.x < _grid.min.x || r.min.x > _grid.max.x) { continue; }
                 r.Draw(Ui.Alpha(color, 0.45f + 0.55f * (float)Math.Min(1.0, n.velocity)), true);
-                if (_selection.Contains(n)) { r.Draw(Color.White, 1.5f); }
+                if (Selected(n)) { r.Draw(Color.White, 1.5f); }
                 else { r.Draw(Color(0.0f, 0.0f, 0.0f, 0.5f), 1.0f); }
                 if (labels && r.width > 30.0f) { Ui.Label(r.Grow(0.0f, -2.0f, 0.0f, -3.0f), NoteName((int)Math.Round(n.pitch)), Color(0.05f, 0.05f, 0.06f, 0.9f), 2.9f); }
             }
@@ -739,6 +759,19 @@ public class PianoRoll
         return Rect(Mathf.Min(x, _heldMouse.x), Mathf.Min(y, _heldMouse.y), Mathf.Max(x, _heldMouse.x), Mathf.Max(y, _heldMouse.y));
     }
 
+    void UpdateBox(Track t)
+    {
+        _boxed.Clear();
+        if (_gesture != Gesture.BoxSelect || t == null) { return; }
+        Rect box = BoxRect();
+        for (int i = 0; i < t.notes.Count(); i++)
+        {
+            if (box.Overlaps(NoteRect(t.notes[i]))) { _boxed.Add(t.notes[i]); }
+        }
+    }
+
+    bool Selected(Note n) { return _selection.Contains(n) || _boxed.Contains(n); }
+
     void Audition(Track t, Note n)
     {
         if (_audition) { _app.Preview(t, n); }
@@ -768,10 +801,9 @@ public class PianoRoll
 
         if (_gesture == Gesture.BoxSelect)
         {
-            Rect box = BoxRect();
-            for (int i = 0; i < t.notes.Count(); i++)
+            for (int i = 0; i < _boxed.Count(); i++)
             {
-                if (box.Overlaps(NoteRect(t.notes[i])) && !_selection.Contains(t.notes[i])) { _selection.Add(t.notes[i]); }
+                if (!_selection.Contains(_boxed[i])) { _selection.Add(_boxed[i]); }
             }
         }
         if (!dragging) { return; }
@@ -784,8 +816,9 @@ public class PianoRoll
     void Press(Track t)
     {
         Note hit = HitNote(t);
-        if (hit == null && Ui.shift)
+        if (hit == null && (_select || Ui.shift || Ui.ctrl))
         {
+            if (!Ui.shift) { _selection.Clear(); }
             Begin(Gesture.BoxSelect);
             return;
         }
@@ -891,7 +924,7 @@ public class PianoRoll
             float x = XAt(n.start);
             if (x < _lane.min.x - 4.0f || x > _lane.max.x + 4.0f) { continue; }
             float h = inner.height * (float)Math.Min(1.0, n.velocity);
-            Rect(x, inner.min.y, x + 3.0f, inner.min.y + h).Draw(_selection.Contains(n) ? Color.White : color, true);
+            Rect(x, inner.min.y, x + 3.0f, inner.min.y + h).Draw(Selected(n) ? Color.White : color, true);
         }
         RectCmd.ClearClip();
         Ui.Tip(_lane, "Velocity: drag over the bars to set each note's level. With Shift, only the selected notes change.");
@@ -911,32 +944,84 @@ public class PianoRoll
         }
     }
 
+    static string NoteCount(int notes) { return notes == 1 ? "1 note" : $"{notes} notes"; }
+
+    bool CopySelection(string verb)
+    {
+        if (_selection.Count() == 0) { return false; }
+        _clipboard.Clear();
+        for (int i = 0; i < _selection.Count(); i++) { _clipboard.Add(_selection[i].Copy()); }
+        _app.Flash(verb + " " + NoteCount(_clipboard.Count()));
+        return true;
+    }
+
+    void DeleteSelection(Track t)
+    {
+        for (int i = 0; i < _selection.Count(); i++) { t.notes.Remove(_selection[i]); }
+        _selection.Clear();
+        _app.StopPreview();
+        _app.Commit();
+    }
+
     void Paste(Track t)
     {
         double first = _clipboard[0].start;
-        for (int i = 1; i < _clipboard.Count(); i++) { first = Math.Min(first, _clipboard[i].start); }
+        double last = _clipboard[0].End();
+        for (int i = 1; i < _clipboard.Count(); i++)
+        {
+            first = Math.Min(first, _clipboard[i].start);
+            last = Math.Max(last, _clipboard[i].End());
+        }
+        // Pasting onto the notes just copied would add nothing, so step past them.
+        double step = last - first;
+        if (SnapSize() > 0.0) { step = Math.Max(1.0, Math.Ceiling(step / SnapSize() - 1e-6)) * SnapSize(); }
         double at = Snap(_app.head);
-        _selection.Clear();
-        int skipped = 0;
+        int steps = 0;
+        while (steps < 64 && AllThere(t, at - first))
+        {
+            at += step;
+            steps++;
+        }
+        List<Note> pasted = new List<Note>();
         for (int i = 0; i < _clipboard.Count(); i++)
         {
             Note n = _clipboard[i].Copy();
             n.start = n.start - first + at;
-            if (NoteAt(t, n.start, n.pitch) != null)
-            {
-                skipped++;
-                continue;
-            }
+            if (NoteAt(t, n.start, n.pitch) != null) { continue; }
             t.notes.Add(n);
-            _selection.Add(n);
+            pasted.Add(n);
         }
-        if (skipped > 0)
+        int skipped = _clipboard.Count() - pasted.Count();
+        if (pasted.Count() == 0)
         {
-            _app.Flash(_selection.Count() > 0 ? $"Pasted {_selection.Count()} notes, {skipped} were already there"
-                : "Those notes are already there: move the playhead to paste elsewhere");
+            _app.Flash("Those notes are already there: move the playhead to paste elsewhere");
+            return;
         }
+        if (skipped > 0) { _app.Flash($"Pasted {NoteCount(pasted.Count())}, {skipped} were already there"); }
+        else { _app.Flash("Pasted " + NoteCount(pasted.Count()) + (steps > 0 ? " after the ones already at the playhead" : "")); }
+        _selection = pasted;
         MakeRoom(t, _selection);
+        Reveal(at);
         _app.Commit();
+    }
+
+    bool AllThere(Track t, double shift)
+    {
+        for (int i = 0; i < _clipboard.Count(); i++)
+        {
+            if (NoteAt(t, _clipboard[i].start + shift, _clipboard[i].pitch) == null) { return false; }
+        }
+        return true;
+    }
+
+    internal void Reveal(double beat)
+    {
+        double visible = (double)_grid.width / _pxPerBeat;
+        if (beat >= _scrollBeats && beat < _scrollBeats + visible * 0.95) { return; }
+        _contentBeats = ContentBeats(_app.song);
+        _scrollBeats = beat - visible * 0.1;
+        _glideBeats = 0.0;
+        ClampView();
     }
 
     void Duplicate(Track t)
@@ -962,7 +1047,7 @@ public class PianoRoll
         _app.Commit();
     }
 
-    static Note NoteAt(Track t, double start, double pitch)
+    internal static Note NoteAt(Track t, double start, double pitch)
     {
         for (int i = 0; i < t.notes.Count(); i++)
         {

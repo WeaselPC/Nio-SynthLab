@@ -21,6 +21,10 @@ run it. Press <kbd>Space</kbd> to hear the demo song.
 Songs save as plain text in a `Songs/` folder next to the app, and **Export WAV** drops
 the loop in `Assets/Audio/`.
 
+**Have a MIDI keyboard?** Pick it from **MIDI in** in the top bar and its keys play the selected
+track's instrument. Turn on **Rec** and press Play to write what you play into the piano roll.
+Plugged it in after starting? Choose **Rescan devices** first.
+
 ## AI disclaimer
   AI (Claude Opus 5.6) was used to setup catalogue (effects, instruments) - I'm not a musician :)
   
@@ -40,19 +44,23 @@ the loop in `Assets/Audio/`.
 | | |
 | --- | --- |
 | Click | Add a note (keep dragging to set its length) |
-| Drag | Move a note, or resize it from its right edge |
+| Drag | Move a note (or the whole selection), or resize from the right edge |
 | Right-click | Delete a note |
-| <kbd>Shift</kbd> + drag | Box select |
+| <kbd>Ctrl</kbd> + drag | Box select |
+| <kbd>S</kbd> | Select tool: plain drag box selects instead of adding notes |
+| <kbd>Shift</kbd> + drag | Box select, adding to the selection |
 | <kbd>Shift</kbd> + click | Add to / remove from the selection |
 | <kbd>Ctrl</kbd> + <kbd>A</kbd> | Select all |
 | <kbd>Esc</kbd> | Deselect |
 | <kbd>Delete</kbd> | Delete the selection |
-| <kbd>Ctrl</kbd> + <kbd>C</kbd> / <kbd>V</kbd> | Copy / paste at the playhead |
+| <kbd>Ctrl</kbd> + <kbd>C</kbd> / <kbd>X</kbd> / <kbd>V</kbd> | Copy / cut / paste at the playhead (or right after the copied notes if they are still there) |
 | <kbd>Ctrl</kbd> + <kbd>D</kbd> | Duplicate |
 | <kbd>←</kbd> <kbd>→</kbd> | Nudge in time |
 | <kbd>↑</kbd> <kbd>↓</kbd> | Nudge a semitone (<kbd>Shift</kbd> for an octave) |
 
 Drag across the bars under the grid to set each note's volume. Click the piano keys to hear the instrument.
+
+**Extend** in the piano roll toolbar makes the song longer by repeating its last bars on every track.
 
 ### Getting around
 
@@ -79,3 +87,11 @@ You can also grab either end of a scrollbar to zoom.
 | Wheel | Step it |
 | Right-click | Type a value |
 | <kbd>Ctrl</kbd> + right-click | Reset |
+
+## License
+
+The project's own code and assets are under [MIT No Attribution](LICENSE). That license does not cover:
+
+- **The built executables** in Releases. They contain the Nio engine runtime, which is not part of this project.
+- **PortMidi**, the library bundled in `Assets/Plugins/PortMidi` for MIDI input. It is under its own
+  [MIT license](Assets/Plugins/PortMidi/Native/portmidi-license.txt), and its notice has to stay with any copy of it.

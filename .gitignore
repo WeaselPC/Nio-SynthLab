@@ -16,3 +16,6 @@ Captures/
 
 Assets/Presets-Dev.ns*
 Songs
+
+# The PortMidi plugin project is hand-written, not generated.
+!PluginSource/**/*.nsproj

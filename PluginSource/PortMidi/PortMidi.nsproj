@@ -1,0 +1,8 @@
+{
+  "type": "library",
+  "outputName": "PortMidi.nslib",
+  "sources": [
+    "MidiIn.ns"
+  ],
+  "references": []
+}

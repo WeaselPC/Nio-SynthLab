@@ -1,0 +1,109 @@
+// Live MIDI input through PortMidi. This file compiles to Assets/Plugins/PortMidi/PortMidi.nslib (see README.md).
+public static class MidiIn
+{
+    [NativeImport("portmidi", EntryPoint = "Pm_Initialize")]
+    static extern int PmInitialize();
+
+    [NativeImport("portmidi", EntryPoint = "Pm_Terminate")]
+    static extern int PmTerminate();
+
+    [NativeImport("portmidi", EntryPoint = "Pm_CountDevices")]
+    static extern int PmCountDevices();
+
+    [NativeImport("portmidi", EntryPoint = "Pm_GetDeviceInfo")]
+    static extern NativePtr PmGetDeviceInfo(int id);
+
+    [NativeImport("portmidi", EntryPoint = "Pm_OpenInput")]
+    static extern int PmOpenInput(out NativePtr stream, int device, NativePtr driverInfo, int bufferSize, NativePtr timeProc, NativePtr timeInfo);
+
+    [NativeImport("portmidi", EntryPoint = "Pm_Close")]
+    static extern int PmClose(NativePtr stream);
+
+    [NativeImport("portmidi", EntryPoint = "Pm_Read")]
+    static extern int PmRead(NativePtr stream, byte[] events, int length);
+
+    // PmDeviceInfo on 64-bit: version, interface*, name*, input, output, opened, virtual.
+    const ulong InfoSize = 40;
+    const ulong InfoName = 16;
+    const ulong InfoInput = 24;
+
+    // A PmEvent is a 4-byte message and a 4-byte timestamp.
+    const int EventSize = 8;
+    const int MaxEvents = 128;
+
+    static bool s_started;
+    static List<int> s_ids = new List<int>();
+    static List<string> s_names = new List<string>();
+    static NativePtr s_stream;
+    static string s_openName = "";
+    static byte[] s_events = new byte[EventSize * MaxEvents];
+
+    public static bool isOpen => !s_stream.IsNull;
+    public static string openName => s_openName;
+    public static int Count() { return s_names.Count(); }
+    public static string Name(int index) { return s_names[index]; }
+
+    // PortMidi lists devices when it starts, so finding new ones restarts it and closes the open one.
+    public static void Scan()
+    {
+        s_stream = NativePtr();
+        s_openName = "";
+        PmTerminate();
+        s_started = PmInitialize() == 0;
+        s_ids.Clear();
+        s_names.Clear();
+        if (!s_started) { return; }
+        int count = PmCountDevices();
+        for (int id = 0; id < count; id++)
+        {
+            NativePtr info = PmGetDeviceInfo(id);
+            if (info.IsNull || NativeMemory.ReadUInt32(info, InfoSize, InfoInput) == 0u) { continue; }
+            NativePtr name = NativeMemory.ReadPointer(info, InfoSize, InfoName);
+            s_ids.Add(id);
+            s_names.Add(name.IsNull ? $"MIDI input {s_ids.Count()}" : NativeMemory.ReadUtf8(name, (ulong)128, (ulong)0));
+        }
+    }
+
+    public static bool Open(int index)
+    {
+        Close();
+        if (!s_started || index < 0 || index >= s_ids.Count()) { return false; }
+        NativePtr stream = NativePtr();
+        if (PmOpenInput(out stream, s_ids[index], NativePtr(), 512, NativePtr(), NativePtr()) != 0 || stream.IsNull) { return false; }
+        s_stream = stream;
+        s_openName = s_names[index];
+        return true;
+    }
+
+    public static void Close()
+    {
+        if (!s_stream.IsNull) { PmClose(s_stream); }
+        s_stream = NativePtr();
+        s_openName = "";
+    }
+
+    public static void Shutdown()
+    {
+        s_stream = NativePtr();
+        s_openName = "";
+        if (s_started) { PmTerminate(); }
+        s_started = false;
+        s_ids.Clear();
+        s_names.Clear();
+    }
+
+    // Reads waiting messages into `events`, 3 bytes each (status, data 1, data 2), and returns how many.
+    public static int Read(byte[] events)
+    {
+        if (s_stream.IsNull) { return 0; }
+        int read = PmRead(s_stream, s_events, Math.Min(MaxEvents, events.Length / 3));
+        // A negative count is an error such as an overflow; the events are lost.
+        for (int i = 0; i < read; i++)
+        {
+            events[i * 3] = s_events[i * EventSize];
+            events[i * 3 + 1] = s_events[i * EventSize + 1];
+            events[i * 3 + 2] = s_events[i * EventSize + 2];
+        }
+        return Math.Max(0, read);
+    }
+}
